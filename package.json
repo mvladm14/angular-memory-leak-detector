@@ -1,0 +1,57 @@
+{
+  "name": "angular-memory-leak-detector",
+  "version": "0.1.0",
+  "description": "Dev-only Angular memory-leak detector. Finds every component through Angular's dev-mode debugging API, watches its destruction, and warns in the console (and emits events) when a destroyed component is still held in memory after a garbage collection. No build plugin, no code changes beyond one provider.",
+  "keywords": [
+    "angular",
+    "memory-leak",
+    "leak-detection",
+    "heap-snapshot",
+    "devtools",
+    "weakref",
+    "finalizationregistry",
+    "debugging"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "demo:install": "node scripts/install-demo.mjs",
+    "e2e": "playwright test",
+    "prepublishOnly": "npm test && npm run typecheck && npm run build"
+  },
+  "license": "MIT",
+  "author": "mvladm14",
+  "peerDependencies": {
+    "@angular/core": ">=16.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@angular/core": "^22.2.6",
+    "@playwright/test": "1.62.1",
+    "@types/node": "^20.19.43",
+    "jsdom": "^29.1.1",
+    "rxjs": "^7.8.2",
+    "typescript": "~6.0",
+    "vitest": "^4.1.12"
+  }
+}
