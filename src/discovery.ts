@@ -8,6 +8,8 @@
 // - `ng.getInjector(el).get(ChangeDetectorRef)` on a component's host returns
 //   the ViewRef of that component's own view. Its `onDestroy` callback fires
 //   when Angular destroys the view: that is the "destroyed" signal.
+// - On Angular 16 and 20, `ng.getDirectives(el)` on each `<router-outlet>`
+//   gives the outlet, whose deactivated pages the router keeps (router.ts).
 //
 // The detector must never retain what it watches. Two things matter:
 //
@@ -23,6 +25,7 @@
 
 import { ChangeDetectorRef } from "@angular/core";
 import { componentNameOf, markDestroyed, track } from "./lifecycle.js";
+import { heldNavigations, isRouterOutlet, OUTLET_TAG, watchOutlet } from "./router.js";
 import type { LiveEntry } from "./types.js";
 
 type NgInjector = { get(token: unknown, notFoundValue?: unknown): unknown };
@@ -31,6 +34,8 @@ type NgInjector = { get(token: unknown, notFoundValue?: unknown): unknown };
 type NgDebugApi = {
   getComponent(element: Element): object | null;
   getInjector(element: Element): NgInjector;
+  /** Only for router outlets, on Angular 16 and 20 (router.ts). */
+  getDirectives?(element: Element): unknown[];
 };
 
 /** What `ChangeDetectorRef` resolves to on a component host: its view's ViewRef. */
@@ -88,6 +93,11 @@ function visit(el: Element, ng: NgDebugApi): void {
   if (!(CONTEXT_KEY in el)) return;
   try {
     withPristineContext(el, () => {
+      if (heldNavigations > 0 && el.localName === OUTLET_TAG && ng.getDirectives) {
+        for (const directive of ng.getDirectives(el)) {
+          if (isRouterOutlet(directive)) watchOutlet(directive);
+        }
+      }
       const instance = ng.getComponent(el);
       if (!instance || seen.has(instance)) return;
       seen.add(instance);

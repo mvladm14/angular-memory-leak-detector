@@ -10,7 +10,8 @@ plugin and no code changes beyond one provider.
 ```
 
 **Development only.** In a production build the provider compiles to an empty
-provider list and the detector is not in the bundle.
+provider list and the detector is not in the bundle (checked on every Angular
+major from 16 to 22).
 
 ## Setup
 
@@ -97,7 +98,7 @@ Change them while the app runs with `window.__ngLeakDetector.configure({ … })`
 
 | Method | |
 | --- | --- |
-| `report()` | Prints and returns a table: per component, instances in memory (`live`), leaked (`stale`), and `awaitingGc`. |
+| `report()` | Prints and returns a table: per component, instances in memory (`live`), leaked (`stale`), `awaitingGc`, and `heldByRouter` (Angular 16 and 20, see below). |
 | `sweep()` | Check for leaks now. |
 | `forceGc()` | `window.gc()` then `sweep()`. Needs Chrome started with `--js-flags="--expose-gc"`. |
 | `configure(options)` | Change options. |
@@ -135,17 +136,49 @@ and returns the same API, or `null` outside development mode.
    the old generation, which only a major garbage collection frees. Witness
    gone but component still reachable means a major collection ran and
    something kept the component, so the detector warns and emits an event.
-5. **Staying out of change detection.** With zone.js, the detector's timer and
+5. **Pages the router keeps.** On Angular 16 and 20 only, the detector also
+   subscribes to each `<router-outlet>`'s `deactivate` output, to know which
+   pages the router itself still holds (see
+   [Angular 16 and 20](#angular-16-and-20-pages-the-router-keeps)).
+6. **Staying out of change detection.** With zone.js, the detector's timer and
    observer run outside Angular's zone, so they never trigger change detection.
 
 ## Compatibility
 
 - Angular 16 or later, standalone or NgModule, with or without zone.js.
-  The end-to-end suite runs on Angular 22, zoneless and with zone.js. The
-  Angular internals it relies on are the same in 16 and 19.
+  The end-to-end suite runs on every major from 16 to 22: with zone.js on
+  all of them, and zoneless from 18 on (experimental in Angular 18 and 19).
 - A browser with `WeakRef` and `FinalizationRegistry` (all current browsers).
   The suite runs in Chromium.
 - Does nothing during server-side rendering.
+
+### Angular 16 and 20: pages the router keeps
+
+On these two versions the Angular router itself keeps the pages it has
+navigated away from in memory for a while: Angular 16 those of the latest
+navigation that started, even one that failed (fixed in 17), Angular 20 those
+of the latest two that succeeded (fixed in 21). In
+a heap snapshot the router is what holds them: `Router` →
+`navigationTransitions` → `currentTransition` (16) or
+`lastSuccessfulNavigation` (20). Later navigations release them, so memory
+doesn't grow, and an app can't fix it.
+
+So on these two versions the detector doesn't judge a page the router still
+holds. `report()` counts it under **heldByRouter**, and once later navigations
+have made the router let go, it is judged like any other destroyed component:
+a page that really leaks is still reported, a navigation or two later than on
+other versions. Nothing changes for components that aren't pages.
+
+The detector learns which pages those are from the `deactivate` and
+`activate` outputs of Angular's `<router-outlet>`: what they emit together is
+one navigation, and one that takes pages down without creating one has failed
+(creating its page threw). A few cases slip through, and a page the router
+still holds may then be reported, until the next navigation:
+
+- pages shown by a custom outlet (Ionic's `<ion-router-outlet>`, for one);
+- on Angular 20, a navigation cancelled while it creates its page, e.g. by
+  `router.navigate()` in that page's constructor;
+- an outlet whose `name` changes while the app runs.
 
 ## Development
 
@@ -158,8 +191,8 @@ npm run build
 
 End-to-end tests run the app in [`demo/`](demo/) (Angular 22, which needs
 Node 22.22+, see `.nvmrc`) in headless Chromium. They cover each leak pattern
-next to its fixed version, router navigation, heap-snapshot names, zone.js, and
-a retained host element:
+next to its fixed version, router navigation (nested routes and a page that
+leaks included), heap-snapshot names, zone.js, and a retained host element:
 
 ```bash
 npm run demo:install # build, pack and install the detector into demo/
@@ -170,6 +203,65 @@ npm run e2e
 To try it by hand, run `npm --prefix demo start`, open http://localhost:4200,
 create and destroy the leaky components, then click **Collect garbage** in
 DevTools → Memory.
+
+### Older Angular versions
+
+The same suite runs on each older major against [`compat/`](compat/): the demo
+app in [`compat/app/`](compat/app/), written in syntax Angular 16 understands
+(`*ngIf`, `@Input()`, `standalone: true`), and one workspace per major,
+`compat/ng16` to `compat/ng21`, set up the way `ng new` sets up that major
+(builder, TypeScript, zone.js, tsconfig), each with its own lockfile. Every
+run first checks that the page runs the expected major.
+
+Most of these majors are out of support, so their toolchains are frozen: each
+workspace pins the exact Node version it is known to work on in its `.nvmrc`
+(today 24.21.0 for all of them), and CI runs each one on its own pin. The
+root and `demo/` follow the current major instead (`24`). Change a pin only in
+a pull request where the whole matrix passes; a workspace that breaks on a
+newer Node keeps its old pin. The scripts warn when the Node running them
+isn't the one an app pins: run `nvm install && nvm use` in that app's folder.
+
+```bash
+npm run compat:install                 # build, pack and install the detector into every compat/ngNN
+npm run e2e:compat                     # the suite on each older major, one after the other
+npm run e2e:compat -- 16 20            # some majors only (22 is demo/)
+npm run e2e:compat -- 18 --grep timer  # extra arguments go to Playwright
+```
+
+`npm run bundle:check` (or `npm run bundle:check -- 16 22`) builds each app
+for production and checks that none of the detector's code is left in it. It
+also builds each app for development and checks that the detector's code is
+found there, so the check can't pass by looking for the wrong thing.
+
+`compat/app/` is copied into each workspace's `src/` by both commands; edit
+it there, not in the copies. To try a major by hand, run
+`npm --prefix compat/ng16 start` after `compat:install`.
+
+When `demo/` moves to a new major, add a `compat/ngNN` for the major it
+leaves (its `package.json`, `angular.json` and `tsconfig.json` as `ng new`
+makes them, and an `.nvmrc` with the exact Node version it passes on) and run
+`npm run compat:install -- NN`. CI picks it up on its own.
+
+### Continuous integration
+
+Two GitHub Actions workflows run on every push to `main` and every pull
+request, side by side: [`ci.yml`](.github/workflows/ci.yml) runs the unit
+tests, the typecheck and the build, and [`e2e.yml`](.github/workflows/e2e.yml)
+runs the end-to-end suite and the production-bundle check with one job per
+Angular major, all in parallel (the majors come from
+`node scripts/e2e-matrix.mjs`). The detector is built and packed once, in a
+job of its own, and every Angular job installs that same tarball
+(`node scripts/install-demo.mjs NN --tarball <file>`): the one npm would
+publish. In CI the apps are installed with `npm ci`, so a lockfile out of step
+with its `package.json` fails the job.
+A failed job uploads Playwright's traces as an artifact.
+
+The workflows pin each action to a commit SHA, with its release in a comment
+(`actions/checkout@<sha> # v5.1.0`): a tag can be moved to other code, a SHA
+can't. Dependabot ([`dependabot.yml`](.github/dependabot.yml)) opens one
+pull request a week when an action has a new release, bumping the SHA and the
+comment together. It watches the actions only: npm dependencies are updated
+by hand, and the compat workspaces' lockfiles stay frozen.
 
 ## License
 

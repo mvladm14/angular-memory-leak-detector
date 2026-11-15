@@ -51,7 +51,10 @@ type DemoId = (typeof DEMOS)[number]["id"];
     @if (shown().has("fixed-listener")) { <app-fixed-listener /> }
     <nav>
       <a routerLink="/" data-testid="nav-home">Home</a> |
-      <a routerLink="/other" data-testid="nav-other">Other</a>
+      <a routerLink="/other" data-testid="nav-other">Other</a> |
+      <a routerLink="/nested" data-testid="nav-nested">Nested</a> |
+      <a routerLink="/leaky" data-testid="nav-leaky">Leaky page</a> |
+      <a routerLink="/broken" data-testid="nav-broken">Broken page</a>
     </nav>
     <router-outlet />
   `,

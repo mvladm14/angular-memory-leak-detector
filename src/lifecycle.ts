@@ -1,7 +1,7 @@
 // Tracking of component instances: `track` when discovery finds one,
 // `markDestroyed` when Angular destroys its view.
 
-import { getStats, live, registry } from "./store.js";
+import { addEntry, getStats } from "./store.js";
 import type { LiveEntry } from "./types.js";
 import { syncWitness } from "./witness.js";
 
@@ -26,9 +26,9 @@ export function track(instance: object, componentName: string, host: string): Li
     createdAt: now,
     destroyedAt: null,
     witness: null,
+    heldByRouter: false,
   };
-  live.add(entry);
-  registry.register(instance, entry);
+  addEntry(instance, entry);
 
   const s = getStats(componentName);
   s.lastCreatedAt = now;

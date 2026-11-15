@@ -57,14 +57,16 @@ const waiting = new Set<LiveEntry>();
 /** The latest released witness, shared until a collection frees it. */
 let current: Witness | null = null;
 
-const probes = new FinalizationRegistry<undefined>(() => {
-  probeArmed = false;
-  noteGc();
-});
+/** Created on first use: nothing here runs at module load (see startWitnesses). */
+let probes: FinalizationRegistry<undefined> | null = null;
 
 function armProbe(): void {
   if (probeArmed) return;
   probeArmed = true;
+  probes ??= new FinalizationRegistry<undefined>(() => {
+    probeArmed = false;
+    noteGc();
+  });
   probes.register({}, undefined);
 }
 
@@ -120,16 +122,22 @@ export function noteGc(): void {
   if (waiting.size > 0 || !stock.every(seasoned)) armProbe();
 }
 
-/** Destroyed for at least `leakAgeMs`. */
+/**
+ * Destroyed for at least `leakAgeMs`, and not a page the router still holds
+ * (router.ts). A held page goes stale when the router lets go of it, so only
+ * a collection after that counts.
+ */
 export function isOverAge(entry: LiveEntry, now: number): boolean {
-  return entry.destroyedAt != null && now - entry.destroyedAt >= _config.leakAgeMs;
+  return (
+    entry.destroyedAt != null && !entry.heldByRouter && now - entry.destroyedAt >= _config.leakAgeMs
+  );
 }
 
 /**
  * Bring the entry's witness in line with its state: one while the instance is
  * over age (as soon as a seasoned one is available), none otherwise. Call
- * after every change to `destroyedAt` and on every sweep, since `leakAgeMs`
- * turns instances stale with time and can be reconfigured.
+ * after every change to `destroyedAt` or `heldByRouter`, and on every sweep,
+ * since `leakAgeMs` turns instances stale with time and can be reconfigured.
  */
 export function syncWitness(entry: LiveEntry, now: number): void {
   if (isOverAge(entry, now)) {
@@ -141,8 +149,8 @@ export function syncWitness(entry: LiveEntry, now: number): void {
       armProbe();
     }
   } else {
-    // `leakAgeMs` was raised: a collection from before doesn't count once it
-    // goes stale again.
+    // `leakAgeMs` was raised, or the router holds the page: a collection from
+    // before doesn't count once it goes stale again.
     entry.witness = null;
     waiting.delete(entry);
   }
@@ -158,6 +166,11 @@ export function survivedGc(entry: LiveEntry): boolean {
   return entry.witness !== null && entry.witness.ref.deref() === undefined;
 }
 
-// Start seasoning at load, so witnesses are ready by the time components go
-// stale.
-restock();
+/**
+ * Start seasoning the stock, so witnesses are ready by the time components go
+ * stale. Called when the detector starts, not at module load: a module with no
+ * side effects at load is one a production build drops entirely.
+ */
+export function startWitnesses(): void {
+  restock();
+}

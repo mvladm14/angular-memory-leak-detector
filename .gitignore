@@ -6,4 +6,9 @@ playwright-report/
 demo/node_modules/
 demo/.angular/
 demo/dist/
+compat/ng*/node_modules/
+compat/ng*/.angular/
+compat/ng*/dist/
+# Copied from compat/app by scripts/compat.mjs.
+compat/ng*/src/
 .DS_Store

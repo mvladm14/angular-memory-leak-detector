@@ -1,0 +1,115 @@
+# The end-to-end suite, and a check that production builds contain none of
+# the detector's code, on every Angular major the detector supports, one job
+# per major, all in parallel: the demo app (demo/) for the latest, the compat
+# workspaces (compat/ngNN) for the older ones. The detector is built and
+# packed once, and every major tests that same tarball, the one npm would
+# publish. Runs alongside ci.yml.
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same branch or pull request cancels the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apps:
+    name: List Angular versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      apps: ${{ steps.list.outputs.apps }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Don't leave the GitHub token in .git/config: no step needs git
+          # credentials after checkout.
+          persist-credentials: false
+      # Each compat/ngNN workspace plus the demo, e.g.
+      # [{"angular":16,"dir":"compat/ng16"}, …, {"angular":22,"dir":"demo"}].
+      - id: list
+        run: echo "apps=$(node scripts/e2e-matrix.mjs)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build the detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Don't leave the GitHub token in .git/config: no step needs git
+          # credentials after checkout.
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run build
+      # npm 11 wants the destination to exist.
+      - run: mkdir -p tarball && npm pack --pack-destination tarball
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: detector-tarball
+          path: tarball/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  e2e:
+    name: Angular ${{ matrix.angular }} (${{ matrix.dir }})
+    needs: [apps, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # A failure on one Angular major doesn't cancel the others.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.apps.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Don't leave the GitHub token in .git/config: no step needs git
+          # credentials after checkout.
+          persist-credentials: false
+      # The Node the app pins: an exact version for a compat workspace, whose
+      # toolchain is frozen; the current major for the demo.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version-file: ${{ matrix.dir }}/.nvmrc
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ${{ matrix.dir }}/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      # The tarball the build job packed.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: detector-tarball
+          path: tarball
+      # Installs that tarball into the app, with `npm ci` (CI is set).
+      - run: node scripts/install-demo.mjs ${{ matrix.angular }} --tarball tarball/*.tgz
+      - id: e2e
+        run: node scripts/e2e-compat.mjs ${{ matrix.angular }}
+      # A production build must contain none of the detector's code. Runs
+      # whether or not the end-to-end tests passed.
+      - name: Check the production bundle
+        if: success() || steps.e2e.conclusion == 'failure'
+        run: node scripts/check-bundle.mjs ${{ matrix.angular }}
+      # Playwright keeps a trace of each failed test (playwright.config.ts).
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-angular-${{ matrix.angular }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
