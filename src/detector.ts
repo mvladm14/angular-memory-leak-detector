@@ -9,6 +9,8 @@ import { live } from "./store.js";
 import { subscribe } from "./subscribers.js";
 import { forceGc, report, sweep } from "./sweep.js";
 import type { LeakDetectorOptions, LeakListener, ReportRow } from "./types.js";
+import { startWitnesses } from "./witness.js";
+import { outsideAngular } from "./zone.js";
 
 export type LeakDetectorApi = {
   /** Print (and return) a table of tracked components. */
@@ -58,15 +60,6 @@ function restartSweepLoop(): void {
 }
 
 /**
- * Run `fn` outside Angular's zone when zone.js is loaded, so the detector's
- * timer and MutationObserver callbacks never trigger change detection.
- */
-function outsideAngular<T>(fn: () => T): T {
-  const root = (globalThis as { Zone?: { root?: { run<R>(f: () => R): R } } }).Zone?.root;
-  return root ? root.run(fn) : fn();
-}
-
-/**
  * Start the detector. Safe to call more than once: later calls only apply
  * `options`. Returns `null` (and does nothing) outside development mode, on
  * the server, and in browsers without WeakRef / FinalizationRegistry.
@@ -94,6 +87,7 @@ export function startMemoryLeakDetector(
     configure(options);
     // `configure({ sweepIntervalMs })` restarts the loop with the new cadence.
     onSweepIntervalChange(restartSweepLoop);
+    startWitnesses();
     startSweepLoop();
     startDiscovery();
   });

@@ -14,6 +14,11 @@ export type LiveEntry = {
    * means a major collection has run since the instance went stale.
    */
   witness: Witness | null;
+  /**
+   * A destroyed page the Angular router itself still holds (Angular 16 and 20,
+   * see router.ts). It gets no verdict until the router lets go of it.
+   */
+  heldByRouter: boolean;
 };
 
 /** A released old-generation object, shared by the instances that went stale in one job. */
@@ -57,6 +62,12 @@ export type ReportRow = {
    * they may just not have been collected yet, so they aren't reported.
    */
   awaitingGc: number;
+  /**
+   * Destroyed pages the Angular router itself still holds after navigating
+   * away from them (Angular 16 and 20 only). They aren't judged until later
+   * navigations make the router let go of them.
+   */
+  heldByRouter: number;
   lastCreatedSecsAgo: number;
 };
 

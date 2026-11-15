@@ -34,7 +34,10 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "demo:install": "node scripts/install-demo.mjs",
+    "compat:install": "node scripts/install-demo.mjs --compat",
     "e2e": "playwright test",
+    "e2e:compat": "node scripts/e2e-compat.mjs",
+    "bundle:check": "node scripts/check-bundle.mjs",
     "prepublishOnly": "npm test && npm run typecheck && npm run build"
   },
   "license": "MIT",

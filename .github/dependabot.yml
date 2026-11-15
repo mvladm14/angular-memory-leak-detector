@@ -1,0 +1,18 @@
+# Keeps the GitHub Actions in .github/workflows up to date. They are pinned to
+# commit SHAs, with the release in a comment (`@<sha> # v5.1.0`); Dependabot
+# bumps both together, and each pull request runs the whole CI matrix.
+#
+# Actions only, on purpose: npm dependencies are left alone. The compat
+# workspaces' lockfiles (compat/ngNN) are frozen, and the root's and the
+# demo's are updated by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # The repository root: Dependabot looks in .github/workflows from there.
+    directory: /
+    schedule:
+      interval: weekly
+    # One pull request for all the actions.
+    groups:
+      github-actions:
+        patterns: ["*"]

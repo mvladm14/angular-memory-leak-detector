@@ -1,69 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadRuntime, type Runtime } from "./helpers";
+import { fakeAngular, flushObserver, loadRuntime, type Runtime } from "./helpers";
 
-type FakeView = {
-  context: unknown;
-  destroyed: boolean;
-  hooks: Array<() => void>;
-  onDestroy(cb: () => void): void;
-  destroy(): void;
-};
-
-/**
- * A stand-in for Angular's dev-mode `window.ng`, shaped like Angular 22's:
- * elements Angular creates carry a numeric `__ngContext__`, and a lookup
- * replaces it with a context object that caches the component.
- */
-function fakeAngular(ChangeDetectorRef: unknown) {
-  const hosts = new Map<Element, { instance: object; view: FakeView }>();
-  let nextId = 1;
-  const getComponent = vi.fn((el: Element) => {
-    const found = hosts.get(el);
-    (el as any).__ngContext__ = { lViewId: 1, component: found?.instance ?? null };
-    return found?.instance ?? null;
-  });
-
-  (globalThis as any).ng = {
-    getComponent,
-    getInjector: (el: Element) => ({
-      get: (token: unknown) =>
-        token === ChangeDetectorRef
-          ? (hosts.get(el)?.view ?? { context: "parent", destroyed: false, onDestroy() {} })
-          : null,
-    }),
-  };
-
-  return {
-    getComponent,
-    /** An element created by Angular that hosts `instance`. */
-    host(tag: string, instance: object) {
-      const el = document.createElement(tag);
-      (el as any).__ngContext__ = nextId++;
-      const view: FakeView = {
-        context: instance,
-        destroyed: false,
-        hooks: [],
-        onDestroy(cb) {
-          this.hooks.push(cb);
-        },
-        destroy() {
-          this.destroyed = true;
-          this.hooks.forEach((h) => h());
-        },
-      };
-      hosts.set(el, { instance, view });
-      return { el, view };
-    },
-    /** An element created by Angular that hosts no component. */
-    plain(tag: string) {
-      const el = document.createElement(tag);
-      (el as any).__ngContext__ = nextId++;
-      return el;
-    },
-  };
-}
-
-const flushObserver = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("discovery", () => {
   let mods: Runtime;
@@ -208,6 +145,27 @@ describe("startMemoryLeakDetector", () => {
     expect(mods.detector.startMemoryLeakDetector({ leakAgeMs: 7_000 })).toBe(api);
     expect(mods.config._config.leakAgeMs).toBe(7_000);
     mods.discovery.stopDiscovery();
+  });
+
+  it("does nothing when its modules load, so production builds can drop them", async () => {
+    vi.resetModules();
+    vi.doUnmock("@angular/core");
+    const created = vi.fn();
+    vi.stubGlobal(
+      "FinalizationRegistry",
+      class extends FinalizationRegistry<unknown> {
+        constructor(cleanup: (held: unknown) => void) {
+          super(cleanup);
+          created();
+        }
+      },
+    );
+    try {
+      await import("../src/index");
+      expect(created).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("does nothing in production mode", async () => {
