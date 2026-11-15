@@ -28,7 +28,7 @@ jobs:
     outputs:
       apps: ${{ steps.list.outputs.apps }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Don't leave the GitHub token in .git/config: no step needs git
           # credentials after checkout.
@@ -43,12 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Don't leave the GitHub token in .git/config: no step needs git
           # credentials after checkout.
           persist-credentials: false
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -57,7 +57,7 @@ jobs:
       - run: npm run build
       # npm 11 wants the destination to exist.
       - run: mkdir -p tarball && npm pack --pack-destination tarball
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: detector-tarball
           path: tarball/*.tgz
@@ -75,14 +75,14 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.apps.outputs.apps) }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Don't leave the GitHub token in .git/config: no step needs git
           # credentials after checkout.
           persist-credentials: false
       # The Node the app pins: an exact version for a compat workspace, whose
       # toolchain is frozen; the current major for the demo.
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ${{ matrix.dir }}/.nvmrc
           cache: npm
@@ -92,7 +92,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       # The tarball the build job packed.
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: detector-tarball
           path: tarball
@@ -107,7 +107,7 @@ jobs:
         run: node scripts/check-bundle.mjs ${{ matrix.angular }}
       # Playwright keeps a trace of each failed test (playwright.config.ts).
       - if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-angular-${{ matrix.angular }}
           path: test-results/
