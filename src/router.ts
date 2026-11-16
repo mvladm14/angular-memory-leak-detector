@@ -11,7 +11,9 @@
 // An app can't fix that. On these two versions a page the router still holds
 // is therefore `heldByRouter`: it gets no verdict while held, and once later
 // navigations push it out it is judged like any other destroyed component. A
-// page that really leaks is still reported, a navigation or two later.
+// page that really leaks is still reported, a navigation or two later. The
+// same goes for its companions (discovery.ts): the directives on its host
+// element and the services that element provides, which the page can keep.
 //
 // The pages come from the public `deactivate` output of every
 // `<router-outlet>`, which emits each page component the router destroys. All
@@ -62,10 +64,13 @@ export function isRouterOutlet(value: unknown): value is Outlet {
   return typeof events === "object" && events !== null && typeof events.subscribe === "function";
 }
 
-/** What the outlets emitted in one synchronous run: one navigation's. */
+/**
+ * What the outlets emitted in one synchronous run: one navigation's. `pages`
+ * also holds the pages' companions.
+ */
 type Run = { pages: Set<LiveEntry>; createdPage: boolean };
 
-/** The pages each of the latest counted navigations took down, oldest first. */
+/** The pages (and companions) each of the latest counted navigations took down, oldest first. */
 const navigations: Set<LiveEntry>[] = [];
 /** The run in progress, until the next microtask. */
 let run: Run | null = null;
@@ -93,15 +98,25 @@ function currentRun(): Run {
   return started;
 }
 
-/** Angular has just destroyed `component`, a page, and emits it. */
+/**
+ * Angular has just destroyed `component`, a page, and emits it. The router
+ * holds the page instance, and with it whatever the page references: that
+ * can be any of its companions (the directives on its host element and the
+ * services that element provides, e.g. a store the page injects), so they are
+ * held, and let go of, with it.
+ */
 function onDeactivate(component: unknown): void {
   if (typeof component !== "object" || component === null) return;
   const entry = entryOf(component);
   if (!entry) return;
-  currentRun().pages.add(entry);
-  entry.heldByRouter = true;
-  // Drops a witness given when the page was destroyed (`leakAgeMs: 0`).
-  syncWitness(entry, Date.now());
+  const { pages } = currentRun();
+  const now = Date.now();
+  for (const held of [entry, ...(entry.companions ?? [])]) {
+    pages.add(held);
+    held.heldByRouter = true;
+    // Drops a witness given when the page was destroyed (`leakAgeMs: 0`).
+    syncWitness(held, now);
+  }
 }
 
 /** An outlet has just created a page. */

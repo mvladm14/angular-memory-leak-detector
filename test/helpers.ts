@@ -73,44 +73,289 @@ export type FakeView = {
 };
 
 /**
- * A stand-in for Angular's dev-mode `window.ng`, shaped like Angular's from
- * 16 to 22 (the end-to-end suite runs on each): elements Angular creates carry
- * a numeric `__ngContext__`, and a lookup replaces it with a context object
- * that caches the component.
+ * A view elements are declared in (an LView): the DestroyRef of every node in
+ * it fires when it is destroyed, and so do the component views of the hosts
+ * in it, as in Angular.
  */
-export function fakeAngular(ChangeDetectorRef: unknown) {
-  const hosts = new Map<Element, { instance: object; view: FakeView }>();
-  const directives = new Map<Element, unknown[]>();
+export type FakeContainerView = {
+  destroyed: boolean;
+  /** Callbacks registered through the DestroyRef of its nodes. */
+  hooks: Array<() => void>;
+  /** Component views of the hosts declared in it. */
+  children: FakeView[];
+  /**
+   * Its LView: the slots of all the nodes declared in it (each node's at
+   * other indexes), and its template's TView at index 1.
+   */
+  lView: unknown[];
+  destroy(): void;
+};
+
+/**
+ * One slot of a node's providers (see `providedServices` in src/discovery.ts):
+ * - `instance`: a class provider Angular has created (`providers: [CartStore]`,
+ *   or `useClass`); its class needs a static `ɵfac`, as Angular's compiler gives it;
+ * - `lazy`: a class provider nothing has injected yet;
+ * - `value`: what a `useValue` / `useExisting` / `useFactory` provider gave;
+ * - `multi`: a multi provider's values;
+ * - `declared`: a provider as the app declared it (`CartStore`,
+ *   `{ provide: Store, useValue: … }`, …), whose factory is one Angular makes
+ *   up (as for a class without a decorator), and `instance` what it created,
+ *   if anything has injected it yet.
+ */
+export type ProviderSlot =
+  | { instance: object }
+  | { lazy: abstract new (...args: never[]) => unknown }
+  | { value: object }
+  | { multi: object[] }
+  | { declared: unknown; instance?: object; isViewProvider?: boolean };
+
+/**
+ * A component's template (a TView): the nodes made `from` one share its
+ * provider slots, as the instances of one component do.
+ */
+export type FakeTemplate = { tView: { blueprint: unknown[]; data: unknown[] }; providerStart: number };
+
+type NodeOptions = {
+  /** The view the node is declared in. By default, one shared view. */
+  in?: FakeContainerView;
+  directives?: object[];
+  providers?: ProviderSlot[];
+  /** Another instance of the same template: same providers, same slots. */
+  from?: FakeTemplate;
+  /** The component whose template the node is in (`ng.getOwningComponent`). */
+  owner?: object;
+};
+
+/** A provider record, as Angular's `ng.ɵgetInjectorProviders` lists it. */
+type ProviderRecord = { token: unknown; provider: unknown; isViewProvider: boolean };
+
+/** Which node a fake NodeInjector is for (Angular's knows its TNode and LView). */
+const INJECTOR_NODE = Symbol("node");
+
+const unwrapForwardRef = (value: any) =>
+  typeof value === "function" && Object.prototype.hasOwnProperty.call(value, "__forward_ref__") ? value() : value;
+
+/** `TNodeProviderIndexes.ProvidersStartIndexMask` and the index of the TView in an LView. */
+const PROVIDERS_START_MASK = 0xfffff;
+const TVIEW = 1;
+
+/**
+ * A stand-in for Angular's dev-mode `window.ng`, shaped like Angular's from
+ * 16 to 22 (the end-to-end suite runs on each): nodes Angular creates carry
+ * a numeric `__ngContext__`, and a lookup replaces it with a context object
+ * that caches the component. `ng.getInjector(node)` returns a NodeInjector
+ * with Angular's private `_tNode` / `_lView` fields, laid out as Angular lays
+ * out a node's providers; `get(DestroyRef)` is the DestroyRef of the view the
+ * node is in. `angular` is the major to mimic: before 20, a DestroyRef has no
+ * `destroyed` and throws on a destroyed view.
+ *
+ * `records` is what `ng.ɵgetInjectorProviders` knows of how providers were
+ * declared: each node's (`"node"`, Angular 17 and later), only the first
+ * view's of each template (`"first-view"`, 16.2), or it doesn't exist
+ * (`"none"`, 16.0 and 16.1).
+ */
+export function fakeAngular(
+  ChangeDetectorRef: unknown,
+  {
+    DestroyRef,
+    angular = 22,
+    records = "node",
+  }: { DestroyRef?: unknown; angular?: number; records?: "node" | "first-view" | "none" } = {},
+) {
+  const hosts = new Map<Node, { instance: object; view: FakeView }>();
+  const directives = new Map<Node, unknown[]>();
+  const owners = new Map<Node, object>();
+  const contexts = new Map<Node, { lView: unknown[]; nodeIndex: number }>();
+  /**
+   * What an `ng.*` lookup leaves on a node, as Angular's does: an LContext,
+   * whose `lView` and `nodeIndex` lead to the node's TNode.
+   */
+  const lContext = (node: Node, cached: object) => {
+    const found = contexts.get(node);
+    return { lViewId: 1, nodeIndex: found?.nodeIndex ?? -1, lView: found?.lView ?? null, ...cached };
+  };
+  const injectors = new Map<
+    Node,
+    { tNode: object; lView: unknown[]; container: FakeContainerView; records: ProviderRecord[] | null }
+  >();
   let nextId = 1;
+
+  /** A view, of a template of its own, or of `template` (another instance of it). */
+  const view = (template?: FakeTemplate): FakeContainerView => ({
+    destroyed: false,
+    hooks: [],
+    children: [],
+    lView: Object.assign([], { [TVIEW]: template?.tView ?? { blueprint: [], data: [] } }),
+    destroy() {
+      this.destroyed = true;
+      this.hooks.forEach((h) => h());
+      this.children.forEach((child) => child.destroy());
+    },
+  });
+  const rootView = view();
+
+  const destroyRefOf = (container: FakeContainerView) => {
+    const ref = {
+      onDestroy(cb: () => void) {
+        if (container.destroyed) throw new Error("NG0911: View has already been destroyed.");
+        container.hooks.push(cb);
+        return () => {};
+      },
+    };
+    if (angular >= 20) Object.defineProperty(ref, "destroyed", { get: () => container.destroyed });
+    return ref;
+  };
+
+  /** Give `node` a view context, directives and providers, like Angular. */
+  const setUp = (
+    node: Node,
+    { in: given, directives: dirs = [], providers = [], from, owner }: NodeOptions,
+    { host }: { host?: object } = {},
+  ) => {
+    (node as any).__ngContext__ = nextId++;
+    if (owner) owners.set(node, owner);
+    if (dirs.length > 0) directives.set(node, dirs);
+    // Another instance of a template is in a view of its own (an LView on
+    // the same TView), unless told which.
+    const container = given ?? (from ? view(from) : rootView);
+    const { lView } = container;
+    const tView = lView[TVIEW] as FakeTemplate["tView"];
+    // Real views hold many nodes' slots: each node's at its own indexes.
+    const providerStart = from?.providerStart ?? 20 + nextId * 10;
+    const template: FakeTemplate = { tView, providerStart };
+    const { blueprint, data } = tView;
+    const nodeRecords: ProviderRecord[] = [];
+    // View providers come first, as in Angular.
+    const ordered = [...providers].sort(
+      (a, b) => Number("isViewProvider" in b && !!b.isViewProvider) - Number("isViewProvider" in a && !!a.isViewProvider),
+    );
+    const viewProviders = ordered.filter((slot) => "isViewProvider" in slot && slot.isViewProvider).length;
+    ordered.forEach((slot, n) => {
+      const i = providerStart + n;
+      const record = (provider: unknown, token: unknown = provider) =>
+        nodeRecords.push({ token, provider, isViewProvider: n < viewProviders });
+      const made = (factory: unknown) => {
+        // Another instance of the template reuses its slots.
+        if (!from) blueprint[i] = { factory, resolving: false };
+        return blueprint[i];
+      };
+      if ("declared" in slot) {
+        const { declared } = slot;
+        const token = typeof declared === "function" ? declared : unwrapForwardRef((declared as any).provide);
+        data[i] = token;
+        // What Angular makes up for what has no `ɵfac` of its own.
+        const factory = made(() => undefined);
+        lView[i] = slot.instance ?? factory;
+        record(declared, token);
+      } else if ("instance" in slot) {
+        data[i] = slot.instance.constructor;
+        made((slot.instance.constructor as any).ɵfac);
+        lView[i] = slot.instance;
+        record(slot.instance.constructor);
+      } else if ("lazy" in slot) {
+        data[i] = slot.lazy;
+        lView[i] = made((slot.lazy as any).ɵfac);
+        record(slot.lazy);
+      } else if ("value" in slot) {
+        const { value } = slot;
+        data[i] = value.constructor;
+        made(() => value);
+        lView[i] = value;
+        record({ provide: value.constructor, useValue: value }, value.constructor);
+      } else {
+        const token = { multiToken: true };
+        data[i] = token;
+        made(() => slot.multi);
+        lView[i] = [...slot.multi];
+        record({ provide: token, useValue: slot.multi, multi: true }, token);
+      }
+    });
+    // A node with no directive has both at -1, as in Angular; a component
+    // counts as one of the node's directives, the first.
+    const instances = host ? [host, ...dirs] : dirs;
+    const directiveCount = instances.length;
+    const tNode =
+      directiveCount === 0
+        ? { providerIndexes: 0, directiveStart: -1, directiveEnd: -1 }
+        : {
+            providerIndexes: (providerStart & PROVIDERS_START_MASK) + viewProviders * 2 ** 20,
+            directiveStart: providerStart + providers.length,
+            directiveEnd: providerStart + providers.length + directiveCount,
+          };
+    // Its directives' slots hold them; the template's, their factories.
+    instances.forEach((instance, k) => {
+      const i = tNode.directiveStart + k;
+      if (!from) blueprint[i] = { factory: () => instance, resolving: false };
+      lView[i] = instance;
+    });
+    // The node's TNode, where a lookup's context (LContext) points.
+    const nodeIndex = providerStart - 5;
+    data[nodeIndex] = tNode;
+    contexts.set(node, { lView, nodeIndex });
+    // Angular 16.2 records only the first view of a template.
+    const recorded = records === "node" || (records === "first-view" && !from);
+    injectors.set(node, { tNode, lView, container, records: recorded ? nodeRecords : null });
+    return { lView, providerStart, container, template };
+  };
+
   const getComponent = vi.fn((el: Element) => {
     const found = hosts.get(el);
-    (el as any).__ngContext__ = { lViewId: 1, component: found?.instance ?? null };
+    (el as any).__ngContext__ = lContext(el, { component: found?.instance ?? null });
     return found?.instance ?? null;
   });
 
-  const getDirectives = vi.fn((el: Element) => {
-    (el as any).__ngContext__ = { lViewId: 1, directives: directives.get(el) ?? [] };
-    return [...(directives.get(el) ?? [])];
+  const getDirectives = vi.fn((node: Node) => {
+    (node as any).__ngContext__ = lContext(node, { directives: directives.get(node) ?? [] });
+    return [...(directives.get(node) ?? [])];
   });
 
-  (globalThis as any).ng = {
-    getComponent,
-    getDirectives,
-    getInjector: (el: Element) => ({
-      get: (token: unknown) =>
-        token === ChangeDetectorRef
-          ? (hosts.get(el)?.view ?? { context: "parent", destroyed: false, onDestroy() {} })
-          : null,
-    }),
-  };
+  const getInjector = vi.fn((node: Node) => {
+    (node as any).__ngContext__ = lContext(node, {});
+    const internals = injectors.get(node);
+    return {
+      [INJECTOR_NODE]: node,
+      _tNode: internals?.tNode ?? null,
+      _lView: internals?.lView ?? null,
+      get: (token: unknown) => {
+        if (token === ChangeDetectorRef) {
+          return hosts.get(node)?.view ?? { context: "parent", destroyed: false, onDestroy() {} };
+        }
+        if (DestroyRef !== undefined && token === DestroyRef && internals) {
+          return destroyRefOf(internals.container);
+        }
+        return null;
+      },
+    };
+  });
+
+  const getInjectorProviders = vi.fn((injector: { [INJECTOR_NODE]?: Node }) => {
+    const internals = injector[INJECTOR_NODE] && injectors.get(injector[INJECTOR_NODE]);
+    if (internals) return internals.records ?? [];
+    throw new Error("getInjectorProviders only supports NodeInjector and EnvironmentInjector");
+  });
+
+  const getOwningComponent = vi.fn((node: Node) => {
+    (node as any).__ngContext__ = lContext(node, {});
+    return owners.get(node) ?? null;
+  });
+
+  (globalThis as any).ng = { getComponent, getDirectives, getInjector, getOwningComponent };
+  if (records !== "none") (globalThis as any).ng.ɵgetInjectorProviders = getInjectorProviders;
 
   return {
     getComponent,
     getDirectives,
+    getInjector,
+    getInjectorProviders,
+    getOwningComponent,
+    /** The view nodes are declared in unless told otherwise. */
+    rootView,
+    /** A new view to declare nodes in, e.g. the embedded view of an `@if`. */
+    view,
     /** An element created by Angular that hosts `instance`. */
-    host(tag: string, instance: object) {
+    host(tag: string, instance: object, options: NodeOptions = {}) {
       const el = document.createElement(tag);
-      (el as any).__ngContext__ = nextId++;
       const view: FakeView = {
         context: instance,
         destroyed: false,
@@ -119,12 +364,25 @@ export function fakeAngular(ChangeDetectorRef: unknown) {
           this.hooks.push(cb);
         },
         destroy() {
+          if (this.destroyed) return;
           this.destroyed = true;
           this.hooks.forEach((h) => h());
         },
       };
       hosts.set(el, { instance, view });
-      return { el, view, instance };
+      const { lView, providerStart, container, template } = setUp(el, options, { host: instance });
+      container.children.push(view);
+      return {
+        el,
+        view,
+        instance,
+        /** Its component's template: pass it as `from` for another instance. */
+        template,
+        /** Angular creates the `n`th provider, e.g. when something injects it later. */
+        create(n: number, created: object) {
+          lView[providerStart + n] = created;
+        },
+      };
     },
     /**
      * A `<router-outlet>` and its RouterOutlet directive. `deactivate` does
@@ -133,7 +391,6 @@ export function fakeAngular(ChangeDetectorRef: unknown) {
      */
     outlet() {
       const el = document.createElement("router-outlet");
-      (el as any).__ngContext__ = nextId++;
       const listeners: Array<(component: unknown) => void> = [];
       const activateListeners: Array<(component: unknown) => void> = [];
       const emitter = (to: Array<(component: unknown) => void>) => ({
@@ -143,12 +400,19 @@ export function fakeAngular(ChangeDetectorRef: unknown) {
         },
       });
       const outlet = { deactivateEvents: emitter(listeners), activateEvents: emitter(activateListeners) };
-      directives.set(el, [{ someOtherDirective: true }, outlet]);
+      setUp(el, { directives: [{ someOtherDirective: true }, outlet] });
       return {
         el,
+        outlet,
         listeners,
         activateListeners,
-        deactivate(page: { instance: object; view: FakeView }) {
+        /**
+         * `view` is the view the page's host is in (the outlet creates one per
+         * page): its DestroyRef fires too, for the directives and services on
+         * the host.
+         */
+        deactivate(page: { instance: object; view: FakeView; hostView?: FakeContainerView }) {
+          if (page.hostView) page.hostView.destroy();
           page.view.destroy();
           listeners.forEach((listener) => listener(page.instance));
         },
@@ -158,10 +422,19 @@ export function fakeAngular(ChangeDetectorRef: unknown) {
       };
     },
     /** An element created by Angular that hosts no component. */
-    plain(tag: string) {
+    plain(tag: string, options: NodeOptions = {}) {
       const el = document.createElement(tag);
-      (el as any).__ngContext__ = nextId++;
+      setUp(el, options);
       return el;
+    },
+    /**
+     * The comment Angular anchors an `<ng-template>` (`kind: "template"`, e.g.
+     * what `*ngIf` makes) or an `<ng-container>` with, in dev mode.
+     */
+    anchor(kind: "template" | "container", options: NodeOptions = {}) {
+      const comment = document.createComment(kind === "template" ? "container" : "ng-container");
+      setUp(comment, options);
+      return comment;
     },
   };
 }

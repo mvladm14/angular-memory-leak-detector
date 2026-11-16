@@ -1,11 +1,11 @@
 // Routed pages, to check that plain navigation (the router destroying a page)
 // is never reported: two pages with cards in them, and a page with a child
-// route. Plus a page that leaks, which must be reported, and one whose
-// navigation fails. Same pages as
-// demo/src/app/pages.ts, in syntax Angular 16 understands: `@Input()` for
-// `input()` and `*ngFor` for `@for`.
+// route, and a page with a service and a host directive it keeps. Plus a page
+// that leaks, which must be reported, and one whose navigation fails. Same
+// pages as demo/src/app/pages.ts, in syntax Angular 16 understands:
+// `@Input()` for `input()` and `*ngFor` for `@for`.
 import { NgFor } from "@angular/common";
-import { Component, Input, inject } from "@angular/core";
+import { Component, Directive, Injectable, Input, inject } from "@angular/core";
 import { RouterOutlet } from "@angular/router";
 import { TickerService } from "./leaks";
 
@@ -54,6 +54,33 @@ export class NestedChildComponent {}
     <router-outlet />`,
 })
 export class NestedPageComponent {}
+
+/** State a page provides for itself (`providers: [PageStateService]`). */
+@Injectable()
+export class PageStateService {
+  visits = 1;
+}
+
+@Directive({ standalone: true, selector: "[appPageTitle]" })
+export class PageTitleDirective {
+  title = "Stateful";
+}
+
+/**
+ * A page that keeps the service it provides and its host directive: where
+ * the router keeps the page (Angular 16 and 20), it keeps them too.
+ */
+@Component({
+  standalone: true,
+  selector: "app-stateful-page",
+  hostDirectives: [PageTitleDirective],
+  providers: [PageStateService],
+  template: `<h2 data-testid="stateful-page">{{ title.title }}: {{ state.visits }}</h2>`,
+})
+export class StatefulPageComponent {
+  readonly state = inject(PageStateService);
+  readonly title = inject(PageTitleDirective);
+}
 
 /** Leak: a page that subscribes to a root service and never unsubscribes. */
 @Component({

@@ -24,6 +24,8 @@ const FINGERPRINTS = {
   lastWarnedAt: /\blastWarnedAt\b/g, // per-component stats: store.ts
   born: /\bborn\b/g, // the witness stock: witness.ts
   heldByRouter: /\bheldByRouter\b/g, // pages the router keeps: router.ts
+  companions: /\bcompanions\b/g, // directives and services on a component's host: discovery.ts, router.ts
+  trackDirectives: /\btrackDirectives\b/g, // what is tracked besides components: config.ts, discovery.ts
 };
 
 const args = process.argv.slice(2);

@@ -1,6 +1,7 @@
 // Installs the detector: `window.__ngLeakDetector`, the sweep loop, and
-// component discovery. Development only — a no-op in production builds,
-// during server-side rendering, and in browsers without WeakRef.
+// discovery of components, directives and component-level services.
+// Development only — a no-op in production builds, during server-side
+// rendering, and in browsers without WeakRef.
 
 import { isDevMode } from "@angular/core";
 import { _config, configure, onSweepIntervalChange } from "./config.js";
@@ -13,7 +14,7 @@ import { startWitnesses } from "./witness.js";
 import { outsideAngular } from "./zone.js";
 
 export type LeakDetectorApi = {
-  /** Print (and return) a table of tracked components. */
+  /** Print (and return) a table of tracked components, directives and services. */
   report(): ReportRow[];
   /** Check for leaks now instead of waiting for the next sweep. */
   sweep(): void;
@@ -23,7 +24,10 @@ export type LeakDetectorApi = {
   configure(options: Partial<LeakDetectorOptions>): void;
   /** Listen for leaks. Returns an unsubscribe function. */
   subscribe(listener: LeakListener): () => void;
-  /** Re-scan the document for components the observer could not see. */
+  /**
+   * Re-scan the document for what the observer could not see: components
+   * rendered into a detached tree, services created after their element.
+   */
   rescan(): void;
 };
 
@@ -93,9 +97,11 @@ export function startMemoryLeakDetector(
   });
 
   if (_config.logging) {
+    const found = { component: 0, directive: 0, service: 0 };
+    live.forEach((entry) => (found[entry.kind] += 1));
     // eslint-disable-next-line no-console
     console.info(
-      `[ng-leak] Memory leak detector running (${live.size} components found). Run window.__ngLeakDetector.report() for a live table.`,
+      `[ng-leak] Memory leak detector running (${found.component} components, ${found.directive} directives, ${found.service} services found). Run window.__ngLeakDetector.report() for a live table.`,
     );
   }
   return api;
