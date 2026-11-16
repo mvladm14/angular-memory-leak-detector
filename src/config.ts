@@ -1,7 +1,7 @@
 // Runtime configuration. Mutable so that `configure()` can hot-update behavior
 // (logging, thresholds, sweep cadence) while the app runs.
 
-import type { LeakDetectorOptions } from "./types.js";
+import type { InstanceKind, LeakDetectorOptions } from "./types.js";
 
 export const _config: LeakDetectorOptions = {
   logging: true,
@@ -10,6 +10,8 @@ export const _config: LeakDetectorOptions = {
   sweepIntervalMs: 2_000,
   warnCooldownMs: 30_000,
   exclude: [],
+  trackDirectives: true,
+  trackServices: true,
 };
 
 const intervalChangeListeners = new Set<() => void>();
@@ -34,4 +36,11 @@ export function isExcluded(name: string): boolean {
   return _config.exclude.some((rule) =>
     typeof rule === "string" ? rule === name : rule.test(name),
   );
+}
+
+/** Components are always tracked; directives and services unless turned off. */
+export function isTrackedKind(kind: InstanceKind): boolean {
+  if (kind === "directive") return _config.trackDirectives;
+  if (kind === "service") return _config.trackServices;
+  return true;
 }

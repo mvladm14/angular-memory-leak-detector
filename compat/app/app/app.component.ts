@@ -5,11 +5,18 @@ import { Component, signal } from "@angular/core";
 import { RouterLink, RouterOutlet } from "@angular/router";
 import {
   FixedListenerComponent,
+  FixedPlainServiceComponent,
+  FixedServiceComponent,
   FixedSubscriptionComponent,
   FixedTimerComponent,
+  FixedTooltipDirective,
   LeakyListenerComponent,
+  LeakyPlainServiceComponent,
+  LeakyServiceComponent,
   LeakySubscriptionComponent,
   LeakyTimerComponent,
+  LeakyTooltipDirective,
+  LeakyViewComponent,
 } from "./leaks";
 
 const DEMOS = [
@@ -19,6 +26,13 @@ const DEMOS = [
   { id: "fixed-subscription", label: "fixed subscription" },
   { id: "leaky-listener", label: "leaky listener" },
   { id: "fixed-listener", label: "fixed listener" },
+  { id: "leaky-directive", label: "leaky directive" },
+  { id: "fixed-directive", label: "fixed directive" },
+  { id: "leaky-service", label: "leaky service" },
+  { id: "fixed-service", label: "fixed service" },
+  { id: "leaky-plain-service", label: "leaky service without @Injectable" },
+  { id: "fixed-plain-service", label: "fixed service without @Injectable" },
+  { id: "leaky-view", label: "component that keeps its view" },
 ] as const;
 
 type DemoId = (typeof DEMOS)[number]["id"];
@@ -37,12 +51,19 @@ type DemoId = (typeof DEMOS)[number]["id"];
     FixedSubscriptionComponent,
     LeakyListenerComponent,
     FixedListenerComponent,
+    LeakyTooltipDirective,
+    FixedTooltipDirective,
+    LeakyServiceComponent,
+    FixedServiceComponent,
+    LeakyPlainServiceComponent,
+    FixedPlainServiceComponent,
+    LeakyViewComponent,
   ],
   template: `
     <h1>Angular memory leak detector demo</h1>
     <p>
-      Create a component, destroy it, then click <b>Collect garbage</b> in DevTools → Memory.
-      Leaky components are reported in the console after about two seconds.
+      Create a component, directive or service, destroy it, then click <b>Collect garbage</b> in
+      DevTools → Memory. Leaky ones are reported in the console after about two seconds.
     </p>
     <button
       *ngFor="let demo of demos"
@@ -58,11 +79,19 @@ type DemoId = (typeof DEMOS)[number]["id"];
     <app-fixed-subscription *ngIf="shown().has('fixed-subscription')" />
     <app-leaky-listener *ngIf="shown().has('leaky-listener')" />
     <app-fixed-listener *ngIf="shown().has('fixed-listener')" />
+    <p *ngIf="shown().has('leaky-directive')" appLeakyTooltip data-testid="leaky-directive">Leaky directive</p>
+    <p *ngIf="shown().has('fixed-directive')" appFixedTooltip data-testid="fixed-directive">Fixed directive</p>
+    <app-leaky-service *ngIf="shown().has('leaky-service')" />
+    <app-fixed-service *ngIf="shown().has('fixed-service')" />
+    <app-leaky-plain-service *ngIf="shown().has('leaky-plain-service')" />
+    <app-fixed-plain-service *ngIf="shown().has('fixed-plain-service')" />
+    <app-leaky-view *ngIf="shown().has('leaky-view')" />
     <nav>
       <a routerLink="/" data-testid="nav-home">Home</a> |
       <a routerLink="/other" data-testid="nav-other">Other</a> |
       <a routerLink="/nested" data-testid="nav-nested">Nested</a> |
       <a routerLink="/leaky" data-testid="nav-leaky">Leaky page</a> |
+      <a routerLink="/stateful" data-testid="nav-stateful">Stateful page</a> |
       <a routerLink="/broken" data-testid="nav-broken">Broken page</a>
     </nav>
     <router-outlet />

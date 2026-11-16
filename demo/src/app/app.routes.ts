@@ -6,6 +6,7 @@ import {
   NestedChildComponent,
   NestedPageComponent,
   OtherPageComponent,
+  StatefulPageComponent,
 } from "./pages";
 
 export const routes: Routes = [
@@ -13,5 +14,6 @@ export const routes: Routes = [
   { path: "other", component: OtherPageComponent },
   { path: "nested", component: NestedPageComponent, children: [{ path: "", component: NestedChildComponent }] },
   { path: "leaky", component: LeakyPageComponent },
+  { path: "stateful", component: StatefulPageComponent },
   { path: "broken", component: BrokenPageComponent },
 ];
