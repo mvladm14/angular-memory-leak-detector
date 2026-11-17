@@ -1,4 +1,4 @@
-import { NgZone } from "@angular/core";
+import { NgZone, isDevMode } from "@angular/core";
 import { bootstrapApplication } from "@angular/platform-browser";
 import type { LeakEvent } from "angular-memory-leak-detector";
 import { AppComponent } from "./app/app.component";
@@ -18,6 +18,8 @@ bootstrapApplication(AppComponent, appConfig).then((appRef) => {
   (window as any).__leakTest = {
     events,
     zone: typeof (globalThis as any).Zone !== "undefined",
+    // Off in a production build (`ngDevMode` is false there).
+    devMode: isDevMode(),
     zoneTurns: () => zoneTurns,
     async collect(cycles = 5) {
       for (let i = 0; i < cycles; i++) {

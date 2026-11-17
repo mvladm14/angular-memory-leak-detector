@@ -4,6 +4,7 @@ type LeakEvent = {
   name: string;
   kind: string;
   host: string;
+  hosts: Array<{ host: string; count: number }>;
   stale: number;
   live: number;
   retained: Array<{ name: string; kind: string; count: number }>;
@@ -13,13 +14,61 @@ type ReportRow = ReturnType<NonNullable<Window["__ngLeakDetector"]>["report"]>[n
 // `window.__ngLeakDetector` is declared by the detector (src/detector.ts).
 declare global {
   interface Window {
-    __leakTest?: { events: LeakEvent[]; zone: boolean; zoneTurns(): number };
+    __leakTest?: { events: LeakEvent[]; zone: boolean; devMode: boolean; zoneTurns(): number };
   }
 }
 
 /** Set per project by playwright.config.ts. */
-type ProjectMetadata = { angular: number; zone: boolean };
+type ProjectMetadata = { angular: number; zone: boolean; production: boolean; minifiedNames: boolean };
 const projectOf = (testInfo: TestInfo) => testInfo.project.metadata as ProjectMetadata;
+
+/**
+ * What the detector calls each class of the app in a production build whose
+ * class names are minified (not restored by ng-leak-names): class names mean
+ * nothing there, so a component or directive goes by its selector, and a
+ * service by the element that provides it and its place among that
+ * element's providers (src/names.ts).
+ */
+const PRODUCTION_NAMES: Readonly<Record<string, string>> = {
+  AppComponent: "app-root",
+  CardComponent: "app-card",
+  HomePageComponent: "app-home-page",
+  OtherPageComponent: "app-other-page",
+  NestedPageComponent: "app-nested-page",
+  NestedChildComponent: "app-nested-child",
+  LeakyPageComponent: "app-leaky-page",
+  StatefulPageComponent: "app-stateful-page",
+  PageTitleDirective: "[appPageTitle]",
+  PageStateService: "app-stateful-page providers[0]",
+  LeakyTimerComponent: "app-leaky-timer",
+  FixedTimerComponent: "app-fixed-timer",
+  LeakySubscriptionComponent: "app-leaky-subscription",
+  FixedSubscriptionComponent: "app-fixed-subscription",
+  LeakyListenerComponent: "app-leaky-listener",
+  FixedListenerComponent: "app-fixed-listener",
+  LeakyTooltipDirective: "[appLeakyTooltip]",
+  FixedTooltipDirective: "[appFixedTooltip]",
+  LeakyServiceComponent: "app-leaky-service",
+  FixedServiceComponent: "app-fixed-service",
+  LeakyStore: "app-leaky-service providers[0]",
+  FixedStore: "app-fixed-service providers[0]",
+  LeakyPlainServiceComponent: "app-leaky-plain-service",
+  FixedPlainServiceComponent: "app-fixed-plain-service",
+  LeakyViewComponent: "app-leaky-view",
+  HighlightDirective: "[appHighlight]",
+  RouterLink: "[routerLink]",
+  ViewState: "app-leaky-view providers[0]",
+};
+
+/** What the detector calls the class `className` in the build under test. */
+function nameIn(testInfo: TestInfo): (className: string) => string {
+  if (!projectOf(testInfo).minifiedNames) return (className) => className;
+  return (className) => {
+    const name = PRODUCTION_NAMES[className];
+    if (name === undefined) throw new Error(`No production name for ${className}: add it to PRODUCTION_NAMES.`);
+    return name;
+  };
+}
 
 type Pair = {
   id: string;
@@ -33,6 +82,11 @@ type Pair = {
   collected?: string[];
   /** Provided with `useValue` and kept on purpose: never tracked, never reported. */
   untracked?: string[];
+  /**
+   * Services whose class has no decorator: found through how Angular
+   * records providers, in development only.
+   */
+  undecorated?: true;
 };
 
 const PAIRS: Pair[] = [
@@ -57,17 +111,24 @@ const PAIRS: Pair[] = [
     kind: "service",
     collected: ["LeakyPlainServiceComponent", "FixedPlainServiceComponent"],
     untracked: ["Labels"],
+    undecorated: true,
   },
 ];
 
 const hostOf = (pair: Pair) => pair.host ?? `app-leaky-${pair.id}`;
 
 /** The start of the console warning for `pair`'s leaky one. */
-function warningOf(pair: Pair): string {
+function warningOf(pair: Pair, testInfo: TestInfo): string {
   const host = hostOf(pair);
-  if (pair.kind === "directive") return `Suspected leak: directive ${pair.leaky} on <${host}>`;
-  if (pair.kind === "service") return `Suspected leak: service ${pair.leaky} provided by <${host}>`;
-  return `Suspected leak: ${pair.leaky} <${host}>`;
+  const name = nameIn(testInfo)(pair.leaky);
+  if (pair.kind === "directive") return `Suspected leak: directive ${name} on <${host}>`;
+  if (!projectOf(testInfo).minifiedNames) {
+    if (pair.kind === "service") return `Suspected leak: service ${name} provided by <${host}>`;
+    return `Suspected leak: ${name} <${host}>`;
+  }
+  // Named after the element already: `app-leaky-service providers[0]`, `app-leaky-timer`.
+  if (pair.kind === "service") return `Suspected leak: service ${name} — `;
+  return `Suspected leak: component <${host}> — `;
 }
 
 async function open(page: Page): Promise<CDPSession> {
@@ -117,15 +178,55 @@ test("finds the running components with their class names", async ({ page }, tes
   const zone = await page.evaluate(() => window.__leakTest!.zone);
   expect(zone).toBe(projectOf(testInfo).zone);
 
+  const n = nameIn(testInfo);
   const report = await page.evaluate(() => window.__ngLeakDetector!.report());
   const live = Object.fromEntries(report.map((r) => [r.name, r.live]));
-  expect(live).toMatchObject({ AppComponent: 1, HomePageComponent: 1, CardComponent: 3 });
-  expect(report.find((r) => r.name === "CardComponent")?.host).toBe("app-card");
+  expect(live).toMatchObject({ [n("AppComponent")]: 1, [n("HomePageComponent")]: 1, [n("CardComponent")]: 3 });
+  expect(report.find((r) => r.name === n("CardComponent"))?.host).toBe("app-card");
   expect(errors).toEqual([]);
 });
 
+test("runs in the production build, without Angular's debugging API", async ({ page }, testInfo) => {
+  test.skip(!projectOf(testInfo).production, "production build only");
+  const infos: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "info") infos.push(msg.text());
+  });
+  await open(page);
+  const build = await page.evaluate(() => ({
+    devMode: window.__leakTest!.devMode,
+    debugApi: typeof (window as { ng?: { getComponent?: unknown } }).ng?.getComponent,
+  }));
+  expect(build).toEqual({ devMode: false, debugApi: "undefined" });
+  // With class names minified, or restored by ng-leak-names.
+  const banner = projectOf(testInfo).minifiedNames
+    ? "[ng-leak] Memory leak detector running in a production build, without Angular's debugging API, classes named by selector (minified build) ("
+    : "[ng-leak] Memory leak detector running in a production build, without Angular's debugging API (";
+  expect(infos.some((info) => info.startsWith(banner)), `no "${banner}" in ${JSON.stringify(infos)}`).toBe(true);
+});
+
+test("finds no service whose class has no decorator in the production build, and reports nothing about them", async ({ page }, testInfo) => {
+  // Angular records how providers were declared in development only, and
+  // without its own factory a class provider can't be told from a `useValue`
+  // one. So neither plain store is found, whether it leaks or not, nor the
+  // constant, and their components are collected as in development.
+  test.skip(!projectOf(testInfo).production, "production build only");
+  const cdp = await open(page);
+  await createAndDestroy(page, "leaky-plain-service");
+  await createAndDestroy(page, "fixed-plain-service");
+  const { events, report } = await collect(page, cdp, 10);
+  expect(events).toEqual([]);
+  const hosts = ["app-leaky-plain-service", "app-fixed-plain-service"];
+  expect(report.filter((r) => hosts.includes(r.host)), "their components must be collected, no service tracked").toEqual([]);
+});
+
 for (const pair of PAIRS) {
-  test(`reports the leaky ${pair.id} and not the fixed one`, async ({ page }) => {
+  test(`reports the leaky ${pair.id} and not the fixed one`, async ({ page }, testInfo) => {
+    test.skip(
+      projectOf(testInfo).production && pair.undecorated === true,
+      "not found in a production build: see the test about services without a decorator",
+    );
+    const n = nameIn(testInfo);
     const warnings: string[] = [];
     page.on("console", (msg) => {
       if (msg.type() === "warning") warnings.push(msg.text());
@@ -136,29 +237,30 @@ for (const pair of PAIRS) {
     await createAndDestroy(page, `fixed-${pair.id}`);
 
     let result = await collect(page, cdp);
-    for (let i = 0; i < 5 && !result.events.some((e) => e.name === pair.leaky); i++)
+    for (let i = 0; i < 5 && !result.events.some((e) => e.name === n(pair.leaky)); i++)
       result = await collect(page, cdp);
 
-    const leak = result.events.find((e) => e.name === pair.leaky);
+    const leak = result.events.find((e) => e.name === n(pair.leaky));
     expect(leak, `${pair.leaky} should be reported`).toMatchObject({
       stale: 1,
       host: hostOf(pair),
+      hosts: [{ host: hostOf(pair), count: 1 }],
       kind: pair.kind ?? "component",
     });
     for (const name of [pair.fixed, ...(pair.collected ?? [])]) {
-      expect(result.events.some((e) => e.name === name), `${name} must not be reported`).toBe(false);
-      expect(result.report.some((r) => r.name === name), `${name} must be collected`).toBe(false);
+      expect(result.events.some((e) => e.name === n(name)), `${name} must not be reported`).toBe(false);
+      expect(result.report.some((r) => r.name === n(name)), `${name} must be collected`).toBe(false);
     }
     // Still in memory, on purpose: only never tracking it keeps it out of the report.
     for (const name of pair.untracked ?? []) {
       expect(result.events.some((e) => e.name === name), `${name} must not be reported`).toBe(false);
       expect(result.report.some((r) => r.name === name), `${name} must not be tracked`).toBe(false);
     }
-    expect(warnings.some((w) => w.includes(warningOf(pair)))).toBe(true);
+    expect(warnings.some((w) => w.includes(warningOf(pair, testInfo)))).toBe(true);
   });
 }
 
-test("reports a component that keeps its view once, with the directives and services in it", async ({ page }) => {
+test("reports a component that keeps its view once, with the directives and services in it", async ({ page }, testInfo) => {
   // Its subscription keeps its ChangeDetectorRef, so its whole view: two
   // HighlightDirective, a RouterLink, and the ViewState it provides. One
   // warning, not one per class.
@@ -166,28 +268,30 @@ test("reports a component that keeps its view once, with the directives and serv
   page.on("console", (msg) => {
     if (msg.type() === "warning") warnings.push(msg.text());
   });
+  const n = nameIn(testInfo);
   const cdp = await open(page);
   await createAndDestroy(page, "leaky-view");
-  const leaked = (events: LeakEvent[]) => events.some((e) => e.name === "LeakyViewComponent");
+  const leaked = (events: LeakEvent[]) => events.some((e) => e.name === n("LeakyViewComponent"));
   let result = await collect(page, cdp);
   for (let i = 0; i < 5 && !leaked(result.events); i++) result = await collect(page, cdp);
 
-  expect([...new Set(result.events.map((e) => e.name))]).toEqual(["LeakyViewComponent"]);
+  expect([...new Set(result.events.map((e) => e.name))]).toEqual([n("LeakyViewComponent")]);
   expect(result.events[0]).toMatchObject({ kind: "component", host: "app-leaky-view", stale: 1 });
   expect(result.events[0]!.retained).toEqual([
-    { name: "HighlightDirective", kind: "directive", count: 2 },
-    { name: "RouterLink", kind: "directive", count: 1 },
-    { name: "ViewState", kind: "service", count: 1 },
+    { name: n("HighlightDirective"), kind: "directive", count: 2 },
+    { name: n("RouterLink"), kind: "directive", count: 1 },
+    { name: n("ViewState"), kind: "service", count: 1 },
   ]);
-  expect(warnings.filter((w) => w.includes("Suspected leak")).every((w) => w.includes("LeakyViewComponent"))).toBe(true);
+  expect(warnings.filter((w) => w.includes("Suspected leak")).every((w) => w.includes(n("LeakyViewComponent")))).toBe(true);
+  const described = projectOf(testInfo).minifiedNames ? "component <app-leaky-view>" : "LeakyViewComponent <app-leaky-view>";
   expect(
     warnings.some((w) =>
       w.includes(
-        "Suspected leak: LeakyViewComponent <app-leaky-view> — 1 instance(s) destroyed >0.5s ago still retained after garbage collection (live 1 total), together with 3 directive(s) and 1 service(s) of its own: HighlightDirective ×2, RouterLink, ViewState.",
+        `Suspected leak: ${described} — 1 instance(s) destroyed >0.5s ago still retained after garbage collection (live 1 total), together with 3 directive(s) and 1 service(s) of its own: ${n("HighlightDirective")} ×2, ${n("RouterLink")}, ${n("ViewState")}.`,
       ),
     ),
   ).toBe(true);
-  const row = (name: string) => result.report.find((r) => r.name === name);
+  const row = (name: string) => result.report.find((r) => r.name === n(name));
   expect(row("HighlightDirective")).toMatchObject({ stale: 0, withOwner: 2 });
   expect(row("ViewState")).toMatchObject({ stale: 0, withOwner: 1 });
 });
@@ -213,6 +317,7 @@ const heldByRouter = (report: ReportRow[]) =>
 test("does not report pages the router destroyed", async ({ page }, testInfo) => {
   // What the router keeps after these navigations: the other page, left
   // last, and on Angular 20 also the home page left before it.
+  const n = nameIn(testInfo);
   const held = ["OtherPageComponent", "HomePageComponent"].slice(0, heldNavigations(testInfo));
   const cdp = await open(page);
   for (let i = 0; i < 3; i++) {
@@ -221,17 +326,18 @@ test("does not report pages the router destroyed", async ({ page }, testInfo) =>
   }
   const { events, report } = await collect(page, cdp, 10);
   expect(events).toEqual([]);
-  expect(heldByRouter(report)).toEqual(Object.fromEntries(held.map((name) => [name, 1])));
+  expect(heldByRouter(report)).toEqual(Object.fromEntries(held.map((name) => [n(name), 1])));
   const live = Object.fromEntries(report.map((r) => [r.name, r.live]));
   const kept = (name: string) => (held.includes(name) ? 1 : 0);
   // Only what is on screen is left, the home page and its three cards, plus
   // what the router keeps.
-  expect(live.OtherPageComponent ?? 0).toBe(kept("OtherPageComponent"));
-  expect(live.HomePageComponent).toBe(1 + kept("HomePageComponent"));
-  expect(live.CardComponent).toBe(3);
+  expect(live[n("OtherPageComponent")] ?? 0).toBe(kept("OtherPageComponent"));
+  expect(live[n("HomePageComponent")]).toBe(1 + kept("HomePageComponent"));
+  expect(live[n("CardComponent")]).toBe(3);
 });
 
 test("does not report a page and its child page the router destroyed together", async ({ page }, testInfo) => {
+  const n = nameIn(testInfo);
   const cdp = await open(page);
   await go(page, "nested");
   await expect(page.getByTestId("nested-child")).toBeVisible();
@@ -242,17 +348,19 @@ test("does not report a page and its child page the router destroyed together", 
   // nested pages down at once: both are held, or both collected.
   const navigations = [["HomePageComponent"], ["NestedChildComponent", "NestedPageComponent"]];
   const held = navigations.slice(navigations.length - heldNavigations(testInfo)).flat();
-  expect(heldByRouter(report)).toEqual(Object.fromEntries(held.map((name) => [name, 1])));
+  expect(heldByRouter(report)).toEqual(Object.fromEntries(held.map((name) => [n(name), 1])));
 
   // Two more navigations: every router has let go of them.
   await go(page, "other");
   await go(page, "home");
   ({ events, report } = await collect(page, cdp, 10));
   expect(events).toEqual([]);
-  expect(report.some((r) => r.name.startsWith("Nested")), "the nested pages must be collected").toBe(false);
+  const nested = [n("NestedPageComponent"), n("NestedChildComponent")];
+  expect(report.some((r) => nested.includes(r.name)), "the nested pages must be collected").toBe(false);
 });
 
 test("does not report pages after a navigation that fails", async ({ page }, testInfo) => {
+  const n = nameIn(testInfo);
   const cdp = await open(page);
   await go(page, "other");
   await go(page, "home");
@@ -264,14 +372,16 @@ test("does not report pages after a navigation that fails", async ({ page }, tes
   expect(events).toEqual([]);
   // Angular 16 keeps the pages of the latest navigation that started, the
   // failed one; Angular 20 those of the latest two that succeeded.
-  const held: Partial<Record<number, Record<string, number>>> = {
-    16: { HomePageComponent: 1 },
-    20: { HomePageComponent: 1, OtherPageComponent: 1 },
+  const held: Partial<Record<number, string[]>> = {
+    16: ["HomePageComponent"],
+    20: ["HomePageComponent", "OtherPageComponent"],
   };
-  expect(heldByRouter(report)).toEqual(held[projectOf(testInfo).angular] ?? {});
+  const expected = held[projectOf(testInfo).angular] ?? [];
+  expect(heldByRouter(report)).toEqual(Object.fromEntries(expected.map((name) => [n(name), 1])));
 });
 
 test("reports a page that leaks, once the router lets go of it", async ({ page }, testInfo) => {
+  const n = nameIn(testInfo);
   const warnings: string[] = [];
   page.on("console", (msg) => {
     if (msg.type() === "warning") warnings.push(msg.text());
@@ -279,12 +389,12 @@ test("reports a page that leaks, once the router lets go of it", async ({ page }
   const cdp = await open(page);
   await go(page, "leaky");
   await go(page, "home");
-  const leaked = (events: LeakEvent[]) => events.some((e) => e.name === "LeakyPageComponent");
+  const leaked = (events: LeakEvent[]) => events.some((e) => e.name === n("LeakyPageComponent"));
   if (heldNavigations(testInfo) > 0) {
     // Held, not judged yet, however many collections run.
     const { events, report } = await collect(page, cdp);
     expect(leaked(events)).toBe(false);
-    expect(heldByRouter(report).LeakyPageComponent).toBe(1);
+    expect(heldByRouter(report)[n("LeakyPageComponent")]).toBe(1);
   }
 
   // Two more navigations: every router has let go of it, and it is still in
@@ -293,19 +403,21 @@ test("reports a page that leaks, once the router lets go of it", async ({ page }
   await go(page, "home");
   let result = await collect(page, cdp);
   for (let i = 0; i < 5 && !leaked(result.events); i++) result = await collect(page, cdp);
-  expect(result.events.find((e) => e.name === "LeakyPageComponent")).toMatchObject({
+  expect(result.events.find((e) => e.name === n("LeakyPageComponent"))).toMatchObject({
     stale: 1,
     host: "app-leaky-page",
   });
   // Nothing else: the pages the router only kept are not reported.
-  expect([...new Set(result.events.map((e) => e.name))]).toEqual(["LeakyPageComponent"]);
-  expect(warnings.some((w) => w.includes("Suspected leak: LeakyPageComponent <app-leaky-page>"))).toBe(true);
+  expect([...new Set(result.events.map((e) => e.name))]).toEqual([n("LeakyPageComponent")]);
+  const described = projectOf(testInfo).minifiedNames ? "component <app-leaky-page>" : "LeakyPageComponent <app-leaky-page>";
+  expect(warnings.some((w) => w.includes(`Suspected leak: ${described}`))).toBe(true);
 });
 
 test("holds what a page provides and its host directive while the router holds the page", async ({ page }, testInfo) => {
   // The stateful page keeps the service it provides and its host directive.
   // Where the router keeps the page (Angular 16 and 20), it keeps them too:
   // they must be held with the page, not reported.
+  const n = nameIn(testInfo);
   const cdp = await open(page);
   await go(page, "stateful");
   await go(page, "home");
@@ -315,17 +427,20 @@ test("holds what a page provides and its host directive while the router holds t
   // The pages (and what they keep) each navigation took down, latest last.
   const navigations = [["HomePageComponent"], stateful];
   const held = navigations.slice(navigations.length - heldNavigations(testInfo)).flat();
-  expect(heldByRouter(report)).toEqual(Object.fromEntries(held.map((name) => [name, 1])));
+  expect(heldByRouter(report)).toEqual(Object.fromEntries(held.map((name) => [n(name), 1])));
 
   // Two more navigations: every router has let go of them.
   await go(page, "other");
   await go(page, "home");
   ({ events, report } = await collect(page, cdp, 10));
   expect(events).toEqual([]);
-  expect(report.filter((r) => stateful.includes(r.name)), "the stateful page and what it keeps must be collected").toEqual([]);
+  const kept = stateful.map(n);
+  expect(report.filter((r) => kept.includes(r.name)), "the stateful page and what it keeps must be collected").toEqual([]);
 });
 
-test("a leaked component is in the heap snapshot under its class name", async ({ page }) => {
+test("a leaked component is in the heap snapshot under its class name", async ({ page }, testInfo) => {
+  // Its class name: in a production build, the one ng-leak-names restored.
+  test.skip(projectOf(testInfo).minifiedNames, "class names restored or kept only: see the next test");
   const cdp = await open(page);
   await createAndDestroy(page, "leaky-timer");
   await createAndDestroy(page, "fixed-timer");
@@ -356,6 +471,80 @@ test("a leaked component is in the heap snapshot under its class name", async ({
   expect([...objects.keys()].some((name) => name.includes("FixedTimerComponent"))).toBe(false);
 });
 
+/** How many objects of each name a heap snapshot of the page holds. */
+async function heapObjects(cdp: CDPSession): Promise<Map<string, number>> {
+  const chunks: string[] = [];
+  const onChunk = ({ chunk }: { chunk: string }) => chunks.push(chunk);
+  cdp.on("HeapProfiler.addHeapSnapshotChunk", onChunk);
+  await cdp.send("HeapProfiler.takeHeapSnapshot", { reportProgress: false });
+  cdp.off("HeapProfiler.addHeapSnapshotChunk", onChunk);
+  const snapshot = JSON.parse(chunks.join("")) as {
+    snapshot: { meta: { node_fields: string[]; node_types: [string[]] } };
+    nodes: number[];
+    strings: string[];
+  };
+  const { node_fields, node_types } = snapshot.snapshot.meta;
+  const width = node_fields.length;
+  const typeAt = node_fields.indexOf("type");
+  const nameAt = node_fields.indexOf("name");
+  const objectType = node_types[0].indexOf("object");
+  const objects = new Map<string, number>();
+  for (let i = 0; i < snapshot.nodes.length; i += width) {
+    if (snapshot.nodes[i + typeAt] !== objectType) continue;
+    const name = snapshot.strings[snapshot.nodes[i + nameAt]!]!;
+    objects.set(name, (objects.get(name) ?? 0) + 1);
+  }
+  return objects;
+}
+
+test("the warning names a leaked component as the heap snapshot does", async ({ page }, testInfo) => {
+  // Whatever the build, what the warning says to filter a heap snapshot for
+  // finds the leaked instance there: its class name (restored by
+  // ng-leak-names in production), or with class names minified, the name
+  // the detector gives the class, if asked to (renameMinifiedClasses).
+  const warnings: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "warning") warnings.push(msg.text());
+  });
+  const n = nameIn(testInfo);
+  const cdp = await open(page);
+  // Before the leaky component's class is first seen: renamed then.
+  if (projectOf(testInfo).minifiedNames) {
+    await page.evaluate(() => window.__ngLeakDetector!.configure({ renameMinifiedClasses: true }));
+  }
+  await createAndDestroy(page, "leaky-timer");
+  await createAndDestroy(page, "fixed-timer");
+  const reported = () => warnings.find((w) => w.includes("Suspected leak:") && w.includes("<app-leaky-timer>"));
+  for (let i = 0; i < 6 && !reported(); i++) await collect(page, cdp);
+
+  const filterFor = /filter for "([^"]+)" to see what holds it/.exec(reported() ?? "")?.[1];
+  expect(filterFor, `the warning: ${reported()}`).toBe(n("LeakyTimerComponent"));
+  const objects = await heapObjects(cdp);
+  // esbuild names the class `_LeakyTimerComponent` in dev builds; DevTools'
+  // filter matches either.
+  const count = (name: string) => (objects.get(name) ?? 0) + (objects.get(`_${name}`) ?? 0);
+  expect(count(filterFor!)).toBe(1);
+  expect(count(n("FixedTimerComponent")), "the fixed one must be collected").toBe(0);
+});
+
+test("with class names minified, leaves classes as they are by default, and says so", async ({ page }, testInfo) => {
+  test.skip(!projectOf(testInfo).minifiedNames, "minified class names only");
+  const warnings: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "warning") warnings.push(msg.text());
+  });
+  const cdp = await open(page);
+  await createAndDestroy(page, "leaky-timer");
+  const reported = () => warnings.find((w) => w.includes("Suspected leak: component <app-leaky-timer>"));
+  for (let i = 0; i < 6 && !reported(); i++) await collect(page, cdp);
+  const minifiedAs = /Its class is minified \("([^"]+)"\)/.exec(reported() ?? "")?.[1];
+  expect(minifiedAs, `the warning: ${reported()}`).toBeTruthy();
+  // Under that name in the heap snapshot, not under the detector's.
+  const objects = await heapObjects(cdp);
+  expect(objects.get("app-leaky-timer") ?? 0).toBe(0);
+  expect(objects.get(minifiedAs!) ?? 0).toBeGreaterThan(0);
+});
+
 test("never runs inside Angular's zone", async ({ page }, testInfo) => {
   test.skip(!projectOf(testInfo).zone, "zone.js only");
   // Not open(): configure() from here would recreate the sweep timer outside
@@ -371,7 +560,7 @@ test("never runs inside Angular's zone", async ({ page }, testInfo) => {
   expect(after - before).toBe(0);
 });
 
-test("a host element kept after destroy does not keep its component", async ({ page }) => {
+test("a host element kept after destroy does not keep its component", async ({ page }, testInfo) => {
   // Angular stores only a numeric view id on elements. Looking a component up
   // through `ng.*` swaps in a context object that holds the component; the
   // detector must undo that, or any retained host element (a DOM-only leak, or
@@ -385,11 +574,12 @@ test("a host element kept after destroy does not keep its component", async ({ p
   await page.getByTestId("toggle-fixed-timer").click();
   await expect(page.getByTestId("fixed-timer")).toHaveCount(0);
   const { events, report } = await collect(page, cdp, 8);
-  expect(events.some((e) => e.name === "FixedTimerComponent")).toBe(false);
-  expect(report.some((r) => r.name === "FixedTimerComponent")).toBe(false);
+  const fixed = nameIn(testInfo)("FixedTimerComponent");
+  expect(events.some((e) => e.name === fixed)).toBe(false);
+  expect(report.some((r) => r.name === fixed)).toBe(false);
 });
 
-test("an element kept after destroy does not keep its directive", async ({ page }) => {
+test("an element kept after destroy does not keep its directive", async ({ page }, testInfo) => {
   // The same for directives: `ng.getDirectives` caches them on the element.
   const cdp = await open(page);
   await page.getByTestId("toggle-fixed-directive").click();
@@ -400,6 +590,7 @@ test("an element kept after destroy does not keep its directive", async ({ page 
   await page.getByTestId("toggle-fixed-directive").click();
   await expect(page.getByTestId("fixed-directive")).toHaveCount(0);
   const { events, report } = await collect(page, cdp, 8);
-  expect(events.some((e) => e.name === "FixedTooltipDirective")).toBe(false);
-  expect(report.some((r) => r.name === "FixedTooltipDirective")).toBe(false);
+  const fixed = nameIn(testInfo)("FixedTooltipDirective");
+  expect(events.some((e) => e.name === fixed)).toBe(false);
+  expect(report.some((r) => r.name === fixed)).toBe(false);
 });

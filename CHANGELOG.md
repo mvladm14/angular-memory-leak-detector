@@ -1,5 +1,86 @@
 # Changelog
 
+## Unreleased
+
+The detector can now run in production builds too, minified ones included.
+
+### Added
+
+- **`provideProductionMemoryLeakDetector(options)`** and
+  **`startProductionMemoryLeakDetector(options)`**: the detector in every
+  build, production included. In development they are
+  `provideMemoryLeakDetector` and `startMemoryLeakDetector`. In a production
+  build, where Angular publishes no `window.ng`, the detector makes the same
+  lookups through `DebugNode`, public API on every major from 16 to 22, and
+  imports nothing private from Angular: a later Angular can't break the build
+  of an app that uses it. Verdicts are the same as in development. `provideMemoryLeakDetector` is unchanged: still nothing
+  of the detector in a production build.
+- **Names that survive minification.** In a minified build, where class names
+  are mangled (esbuild names nearly every class `e`), components and
+  directives are named by their selector (`app-user-card`, `[appTooltip]`),
+  a component with none by its component id (`ng-component (c2736387395)`),
+  and services by the element that provides them and their place among its
+  providers (`app-cart providers[0]`, one name for each place a service is
+  provided). These names depend only on what leaked, never on what was
+  seen first, so the same leak has the same name in every session, and
+  from one build to the next. Builds that keep class names, or whose names `ng-leak-names`
+  restored (below), keep them. A build that minifies the app's code but not its
+  dependencies (Angular 17's dev server, serving an optimized configuration)
+  names the app's classes this way, where they used to share one name.
+- **`ng-leak-names`**, a command that comes with the package, an extra layer
+  over selector names for builds that make source maps anyway: run after
+  `ng build` (`npx ng-leak-names dist/my-app`), it gives every class of the
+  build its name back from the build's source maps (hidden ones are enough),
+  as a static `name` field, and updates the source maps. Warnings and heap
+  snapshots of a production build then show `UserCardComponent`, as in
+  development. Without source maps, or with maps that lack the sources, it
+  warns and leaves the build as it is (exit code 0). It updates the hashes
+  Angular writes of what it changes (Subresource Integrity in
+  `index.html`, `ngsw.json`), and leaves a build that pins them anywhere
+  else as it is (exit code 0), e.g. webpack's hashes of lazy chunks with
+  Subresource Integrity. It changes the build all at once or not at all,
+  and refuses one a previous run was interrupted in (exit code 1).
+- **`renameMinifiedClasses`** (default `false`): a minified class the
+  detector names by its selector or provider gets that name as its `name`
+  too, so a heap snapshot shows the leaked instance under the name the
+  warning gives. Only classes whose name is minified are renamed. Off by
+  default: a class is renamed when the detector first sees it, so errors
+  thrown in it before and after have different stack traces.
+- **`exclude` takes classes** (`exclude: [CacheComponent]`), which work in
+  every build, where names change with minification.
+- **`hosts`** on events and `report()` rows: the tags of the elements the
+  class's instances are on, in alphabetical order, each with how many (type
+  `HostCount`): in an event, where it leaked; in a row, where its instances
+  in memory are. A warning about instances on elements of several tags
+  lists them: `directive TooltipDirective on <a>, <button> ×2`.
+- `ClassRef`, the type of a class in `exclude`.
+- A warning when Angular has rendered the app but the detector finds none of
+  its components, as it would on a version of Angular that lays out its
+  views in a way the detector doesn't know: it then reports no leaks, and
+  says so.
+
+### Changed
+
+- **`host` no longer depends on the order elements were seen in.** It was the
+  tag of the first element the detector saw with the class on, which could
+  differ from one session to the next. In an event it is now the first, in
+  alphabetical order, of the tags the leaked instances are on; in a
+  `report()` row, of those its instances in memory are on. Rows with the
+  same counts are in the order of their names, not of when their classes
+  were first seen.
+
+### Fixed
+
+- A template anchor whose comment Angular rewrote with its bindings
+  (`bindings={…}`, in development on Angular 16 to 19, and later with
+  ng-reflect on) is reported as `ng-template`, not `ng-container`: the
+  node's type says which, when the comment doesn't.
+
+### Limitations
+
+- In a production build, services whose class has no decorator are not
+  found: Angular records how providers were declared in development only.
+
 ## 0.2.0
 
 The detector now watches directives and component-level services too, not

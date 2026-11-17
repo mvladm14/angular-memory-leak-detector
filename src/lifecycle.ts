@@ -7,30 +7,17 @@ import { addEntry, getStats, noteDestroyed } from "./store.js";
 import type { InstanceKind, LiveEntry } from "./types.js";
 import { syncWitness } from "./witness.js";
 
-/** Per class, its name: one string shared by all its instances' entries. */
-let names = new WeakMap<Function, string>();
-
 /**
- * The instance's class name. Dev builds made with esbuild (the Angular CLI's
- * default builder since v17) emit `class _UserCardComponent`, so a leading
- * underscore before a capital letter is dropped.
+ * `className` is the class's name at runtime, minified or not (names.ts): the
+ * one a heap snapshot shows. By default `componentName`, as in a build that
+ * keeps class names.
  */
-export function componentNameOf(instance: object): string {
-  const ctor = (instance as { constructor?: unknown }).constructor;
-  if (typeof ctor !== "function") return "Unknown";
-  let name = names.get(ctor);
-  if (name === undefined) {
-    name = ctor.name.replace(/^_+(?=[A-Z])/, "") || "Unknown";
-    names.set(ctor, name);
-  }
-  return name;
-}
-
 export function track(
   instance: object,
   componentName: string,
   host: string,
   kind: InstanceKind = "component",
+  className: string = componentName,
 ): LiveEntry {
   const entry: LiveEntry = {
     ref: new WeakRef(instance),
@@ -46,9 +33,10 @@ export function track(
   addEntry(instance, entry);
   const s = getStats(componentName);
   s.lastCreatedAt = Date.now();
-  if (!s.host) {
-    s.host = host;
+  if (!s.seen) {
+    s.seen = true;
     s.kind = kind;
+    s.className = className;
   }
   return entry;
 }

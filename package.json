@@ -1,7 +1,7 @@
 {
   "name": "angular-memory-leak-detector",
   "version": "0.2.0",
-  "description": "Dev-only Angular memory-leak detector. Finds every component, directive and component-level service through Angular's dev-mode debugging API, watches their destruction, and warns in the console (and emits events) when a destroyed one is still held in memory after a garbage collection. No build plugin, no code changes beyond one provider.",
+  "description": "Angular memory-leak detector for development, and for production builds if you opt in. Finds every component, directive and component-level service through Angular's debugging API (or, in production builds, the same lookups without it), watches their destruction, and warns in the console (and emits events) when a destroyed one is still held in memory after a garbage collection. No build plugin, no code changes beyond one provider.",
   "keywords": [
     "angular",
     "memory-leak",
@@ -10,7 +10,8 @@
     "devtools",
     "weakref",
     "finalizationregistry",
-    "debugging"
+    "debugging",
+    "production"
   ],
   "type": "module",
   "main": "./dist/index.js",
@@ -24,8 +25,12 @@
     "./package.json": "./package.json"
   },
   "sideEffects": false,
+  "bin": {
+    "ng-leak-names": "./bin/ng-leak-names.mjs"
+  },
   "files": [
     "dist/",
+    "bin/",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

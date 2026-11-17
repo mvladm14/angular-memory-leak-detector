@@ -5,6 +5,8 @@
   "description": "The compat app (../app) on Angular 19, for the Playwright suite in ../../e2e.",
   "scripts": {
     "start": "ng serve",
+    "start:production": "ng build --configuration production-detector --output-path dist/production-detector --progress=false && ng-leak-names dist/production-detector --quiet && node ../../scripts/serve-static.mjs dist/production-detector",
+    "start:production-minified": "ng build --configuration production-detector --output-path dist/production-minified --progress=false && node ../../scripts/serve-static.mjs dist/production-minified",
     "start:zoneless": "ng serve --configuration zoneless",
     "build": "ng build"
   },

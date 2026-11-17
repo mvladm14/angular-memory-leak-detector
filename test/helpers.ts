@@ -14,19 +14,59 @@ export type Runtime = {
   discovery: typeof import("../src/discovery");
   detector: typeof import("../src/detector");
   router: typeof import("../src/router");
+  names: typeof import("../src/names");
+  production: typeof import("../src/production");
 };
 
 /**
- * `angular` stands in for the Angular major (`VERSION.major`) the detector
- * runs on; by default, the one installed.
+ * What src/production.ts uses of `@angular/core` (`DebugNode`), standing in
+ * for a production build's: set by `fakeAngular(…, { production: true })`,
+ * used by `loadRuntime({ production: true })`.
  */
-export async function loadRuntime({ seasoned = true, angular }: { seasoned?: boolean; angular?: number } = {}): Promise<Runtime> {
+type ProductionCore = {
+  injector(node: Node): unknown;
+  componentInstance(node: Node): unknown;
+};
+let productionCore: ProductionCore | null = null;
+const core = () => {
+  if (!productionCore) throw new Error("fakeAngular(…, { production: true }) first");
+  return productionCore;
+};
+
+/** Angular's public DebugNode, as src/production.ts uses it. */
+class FakeDebugNode {
+  constructor(readonly nativeNode: Node) {}
+  get injector() {
+    return core().injector(this.nativeNode);
+  }
+  get componentInstance() {
+    return core().componentInstance(this.nativeNode);
+  }
+}
+
+/**
+ * `angular` stands in for the Angular major (`VERSION.major`) the detector
+ * runs on; by default, the one installed. `production`: what the detector
+ * imports from `@angular/core` for production builds (src/production.ts) is
+ * the fake's, see `fakeAngular`. `minified`: class names are minified, as in
+ * a minified production build (src/names.ts).
+ */
+export async function loadRuntime({
+  seasoned = true,
+  angular,
+  production = false,
+  minified = false,
+}: { seasoned?: boolean; angular?: number; production?: boolean; minified?: boolean } = {}): Promise<Runtime> {
   vi.resetModules();
-  if (angular === undefined) vi.doUnmock("@angular/core");
+  if (angular === undefined && !production) vi.doUnmock("@angular/core");
   else {
     vi.doMock("@angular/core", async (importOriginal) => {
-      const core = await importOriginal<typeof import("@angular/core")>();
-      return { ...core, VERSION: { ...core.VERSION, major: String(angular) } };
+      const real = await importOriginal<typeof import("@angular/core")>();
+      return {
+        ...real,
+        ...(angular === undefined ? {} : { VERSION: { ...real.VERSION, major: String(angular) } }),
+        ...(production ? { DebugNode: FakeDebugNode } : {}),
+      };
     });
   }
   const mods: Runtime = {
@@ -39,7 +79,10 @@ export async function loadRuntime({ seasoned = true, angular }: { seasoned?: boo
     discovery: await import("../src/discovery"),
     detector: await import("../src/detector"),
     router: await import("../src/router"),
+    names: await import("../src/names"),
+    production: await import("../src/production"),
   };
+  if (minified) mods.names.setClassNamesMinified(true);
   // What starting the detector does (src/detector.ts).
   mods.witness.startWitnesses();
   // A page that has been running for a while: the whole witness stock has
@@ -104,7 +147,7 @@ export type FakeContainerView = {
  *   if anything has injected it yet.
  */
 export type ProviderSlot =
-  | { instance: object }
+  | { instance: object; isViewProvider?: boolean }
   | { lazy: abstract new (...args: never[]) => unknown }
   | { value: object }
   | { multi: object[] }
@@ -139,6 +182,10 @@ const unwrapForwardRef = (value: any) =>
 /** `TNodeProviderIndexes.ProvidersStartIndexMask` and the index of the TView in an LView. */
 const PROVIDERS_START_MASK = 0xfffff;
 const TVIEW = 1;
+/** Angular's TNodeType of an element, an `<ng-template>` and an `<ng-container>`. */
+const TNODE_ELEMENT = 2;
+const TNODE_CONTAINER = 4;
+const TNODE_ELEMENT_CONTAINER = 8;
 
 /**
  * A stand-in for Angular's dev-mode `window.ng`, shaped like Angular's from
@@ -154,6 +201,12 @@ const TVIEW = 1;
  * declared: each node's (`"node"`, Angular 17 and later), only the first
  * view's of each template (`"first-view"`, 16.2), or it doesn't exist
  * (`"none"`, 16.0 and 16.1).
+ *
+ * `production`: a production build instead, where Angular publishes no
+ * `window.ng` (and records no providers), and anchors templates and
+ * containers with empty comments. What the detector uses there instead
+ * (src/production.ts), `DebugNode`, is faked from the same views, for
+ * `loadRuntime({ production: true })`: its `injector` is `getInjector`'s.
  */
 export function fakeAngular(
   ChangeDetectorRef: unknown,
@@ -161,7 +214,8 @@ export function fakeAngular(
     DestroyRef,
     angular = 22,
     records = "node",
-  }: { DestroyRef?: unknown; angular?: number; records?: "node" | "first-view" | "none" } = {},
+    production = false,
+  }: { DestroyRef?: unknown; angular?: number; records?: "node" | "first-view" | "none"; production?: boolean } = {},
 ) {
   const hosts = new Map<Node, { instance: object; view: FakeView }>();
   const directives = new Map<Node, unknown[]>();
@@ -207,11 +261,14 @@ export function fakeAngular(
     return ref;
   };
 
-  /** Give `node` a view context, directives and providers, like Angular. */
+  /**
+   * Give `node` a view context, directives and providers, like Angular.
+   * `type`: its TNodeType, an element (2) unless said otherwise.
+   */
   const setUp = (
     node: Node,
     { in: given, directives: dirs = [], providers = [], from, owner }: NodeOptions,
-    { host }: { host?: object } = {},
+    { host, type = TNODE_ELEMENT }: { host?: object; type?: number } = {},
   ) => {
     (node as any).__ngContext__ = nextId++;
     if (owner) owners.set(node, owner);
@@ -275,13 +332,16 @@ export function fakeAngular(
     // counts as one of the node's directives, the first.
     const instances = host ? [host, ...dirs] : dirs;
     const directiveCount = instances.length;
+    // `componentOffset`: where its component is among them, -1 if none.
     const tNode =
       directiveCount === 0
-        ? { providerIndexes: 0, directiveStart: -1, directiveEnd: -1 }
+        ? { type, providerIndexes: 0, directiveStart: -1, directiveEnd: -1, componentOffset: -1 }
         : {
+            type,
             providerIndexes: (providerStart & PROVIDERS_START_MASK) + viewProviders * 2 ** 20,
             directiveStart: providerStart + providers.length,
             directiveEnd: providerStart + providers.length + directiveCount,
+            componentOffset: host ? 0 : -1,
           };
     // Its directives' slots hold them; the template's, their factories.
     instances.forEach((instance, k) => {
@@ -340,8 +400,21 @@ export function fakeAngular(
     return owners.get(node) ?? null;
   });
 
-  (globalThis as any).ng = { getComponent, getDirectives, getInjector, getOwningComponent };
-  if (records !== "none") (globalThis as any).ng.ɵgetInjectorProviders = getInjectorProviders;
+  if (production) {
+    delete (globalThis as any).ng;
+    productionCore = {
+      // Angular's DebugNode: the node's injector, leaving its context on it.
+      injector: (node) => getInjector(node),
+      // Angular's DebugNode: the node's component, or else its owning one.
+      componentInstance: (node) => {
+        (node as any).__ngContext__ = lContext(node, {});
+        return hosts.get(node)?.instance ?? owners.get(node) ?? null;
+      },
+    };
+  } else {
+    (globalThis as any).ng = { getComponent, getDirectives, getInjector, getOwningComponent };
+    if (records !== "none") (globalThis as any).ng.ɵgetInjectorProviders = getInjectorProviders;
+  }
 
   return {
     getComponent,
@@ -432,8 +505,10 @@ export function fakeAngular(
      * what `*ngIf` makes) or an `<ng-container>` with, in dev mode.
      */
     anchor(kind: "template" | "container", options: NodeOptions = {}) {
-      const comment = document.createComment(kind === "template" ? "container" : "ng-container");
-      setUp(comment, options);
+      // A production build leaves them empty.
+      const text = production ? "" : kind === "template" ? "container" : "ng-container";
+      const comment = document.createComment(text);
+      setUp(comment, options, { type: kind === "template" ? TNODE_CONTAINER : TNODE_ELEMENT_CONTAINER });
       return comment;
     },
   };
@@ -441,3 +516,21 @@ export function fakeAngular(
 
 /** Let the MutationObserver deliver. */
 export const flushObserver = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * A class as a minified production build has it: named `e`, as esbuild names
+ * nearly every class, with the definition Angular's compiler adds to a
+ * component (`ɵcmp`) or directive (`ɵdir`), which holds its selector as
+ * written (`[["app-card"]]`, `[["", "appTooltip", ""]]`), and for a
+ * component its id. Or, with no definition, a service: `@Injectable()` adds
+ * its factory.
+ */
+export function minifiedClass(
+  def?: { component?: unknown[][]; directive?: unknown[][]; id?: string },
+): new () => object {
+  const cls = { e: class {} }.e;
+  if (def?.component) Object.assign(cls, { ɵcmp: { selectors: def.component, id: def.id ?? "c1" } });
+  else if (def?.directive) Object.assign(cls, { ɵdir: { selectors: def.directive } });
+  else Object.assign(cls, { ɵfac: () => new cls() });
+  return cls;
+}

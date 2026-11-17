@@ -24,9 +24,12 @@ What it watches:
   Root services (`providedIn: "root"`) live as long as the app and are not
   watched.
 
-**Development only.** In a production build the provider compiles to an empty
-provider list and the detector is not in the bundle (checked on every Angular
-major from 16 to 22).
+**Development only, unless you opt in.** With `provideMemoryLeakDetector()`,
+a production build compiles the provider to an empty provider list and the
+detector is not in the bundle (checked on every Angular major from 16 to 22).
+To catch leaks in production builds too, minified ones included, use
+`provideProductionMemoryLeakDetector()` instead: see
+[Production builds](#production-builds).
 
 ## Setup
 
@@ -129,20 +132,194 @@ provideMemoryLeakDetector({
   warnCooldownMs: 30_000, // minimum time between two reports of one class
   suspectThreshold: 1,    // stale instances of a class needed to report it
   logging: true,          // console output
-  exclude: [],            // class names or RegExps never reported, e.g. kept on purpose
+  exclude: [],            // class names, RegExps or classes never reported, e.g. kept on purpose
   trackDirectives: true,  // watch directives too
   trackServices: true,    // watch component-level services too
+  renameMinifiedClasses: false, // in a minified build, see Production builds
 });
 ```
 
 `exclude` applies to components, directives and services alike, e.g.
-`exclude: [/^Router/]` for Angular's `RouterLink` and `RouterOutlet`.
+`exclude: [/^Router/]` for Angular's `RouterLink` and `RouterOutlet`. It
+takes the classes themselves too (`exclude: [CacheComponent]`), which work
+in every build, minified ones included, where class names don't (see
+[Production builds](#production-builds)).
 Turning `trackDirectives` or `trackServices` off stops tracking new ones and
 hides those already tracked from `report()` and from leak reports. With both
 off, only components are tracked: a place to start if an app with many
 directives or component-level services feels slow to render in development.
 
 Change them while the app runs with `window.__ngLeakDetector.configure({ … })`.
+
+## Production builds
+
+Some leaks only show with real users, real data and long sessions. To watch
+for them in production, use `provideProductionMemoryLeakDetector()` in place
+of `provideMemoryLeakDetector()`, and install the package as a dependency
+rather than a dev dependency. It takes the same options. Keep the console
+quiet and send the leaks to your monitoring instead:
+
+```ts
+import { provideProductionMemoryLeakDetector } from "angular-memory-leak-detector";
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    // ...
+    provideProductionMemoryLeakDetector({ logging: false }),
+  ],
+};
+```
+
+```ts
+bootstrapApplication(AppComponent, appConfig).then(() => {
+  window.__ngLeakDetector?.subscribe((leak) => monitoring.track("memory-leak", leak));
+});
+```
+
+In a development build it is `provideMemoryLeakDetector()`: everything above
+applies. A production build differs in three ways.
+
+**No debugging API.** Angular publishes `window.ng` in development only. In
+production the detector makes the same lookups without it, through what
+Angular keeps in every build: the view id it stores on the elements and
+comments it creates, which the public `DebugNode` turns into the node's
+injector and view, and the view data that says where the node's component
+and directives are. It imports nothing private from Angular (see
+[Compatibility](#compatibility)). Verdicts are the same as in development: the
+end-to-end suite runs on a production build of each major, with the same
+leaks reported, the same ones not, and the same pages held by the router.
+What production doesn't keep is how providers were declared, so services
+whose class has no decorator aren't watched there (see
+[Limitations](#limitations)).
+
+**Names by selector.** A minified build renames classes: esbuild and terser
+name nearly all of them `e`. So in a production build, the detector names
+each class by what its code declares as a string, which minifiers keep and
+which stays the same from one build to the next. This works on any build,
+with nothing to set up:
+
+| | Development | Minified production build |
+| --- | --- | --- |
+| Component | `UserCardComponent` | its selector: `app-user-card` |
+| Directive | `TooltipDirective` | its selector: `[appTooltip]` |
+| Service | `CartStore` | the element that provides it, and its place among that element's providers (view providers first): `app-cart providers[0]` |
+
+A name depends only on what leaked, never on what the detector saw before
+it: the same leak has the same name in every session, so leaks reported
+from many sessions can be grouped by `name`.
+
+```
+[ng-leak] Suspected leak: component <app-user-card> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total). Its class is minified ("e"): to see what holds it in a heap snapshot, restore class names with ng-leak-names if the build has source maps, or reproduce the leak in a development build.
+[ng-leak] Suspected leak: directive [appTooltip] on <button> — …
+[ng-leak] Suspected leak: service app-cart providers[0] — …
+```
+
+A heap snapshot names an object after its class's `name` (in Chromium), and
+the detector leaves classes as they are, so there the leaked instance is
+still an `e`. To find it by the warning's name, set `renameMinifiedClasses:
+true`: the detector then makes that name the class's `name` too, and the
+warning says `Take a heap snapshot and filter for "app-user-card"`. It is
+off by default because a class is renamed only when the detector first sees
+one of its instances: an error thrown in it before then has `e` in its stack
+trace, and one thrown after has `app-user-card`, which error trackers may
+group as two errors. Or restore class names with `ng-leak-names` (below),
+which names every class before the app starts.
+
+Only classes whose name is minified are renamed: a name like `e` says
+nothing, so nothing can depend on it. A component that declares no selector
+goes by its component id, the one in its host's `_nghost-ng-c…` attribute:
+`ng-component (c2736387395)`. A service's element is named after its
+component, or else its first directive. Each instance of a service is named
+after where it is provided, so a `CartStore` that two components provide
+goes by two names, one for each. Its class can have only one `name`, though:
+the first one the detector gives it, and each warning says which name to
+filter a heap snapshot for. Classes that share a selector share their name.
+In a build that keeps class names, the detector keeps them too; in one that
+minifies the app's code but not its dependencies (Angular 17's dev server
+does, serving an optimized configuration), only the app's classes go by
+these names.
+
+That name is `name` in events and `report()` rows, and what `exclude`
+matches: list the classes themselves to exclude them in every build.
+
+**Class names, if the build makes source maps.** An extra layer, for builds
+that make source maps for their scripts anyway (for error reporting, say):
+the maps still know every class's name, and `ng-leak-names`, which comes
+with the package, puts them back into the build after `ng build`. Warnings
+and heap snapshots then read exactly as in development:
+
+```
+[ng-leak] Suspected leak: UserCardComponent <app-user-card> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total). Take a heap snapshot and filter for "UserCardComponent" to see what holds it.
+```
+
+```bash
+ng build && npx ng-leak-names dist/my-app
+```
+
+Hidden source maps are enough (`"sourceMap": { "scripts": true, "hidden":
+true }` in `angular.json`): the code doesn't point to them, so they needn't
+be deployed. They must include the sources (`sourcesContent`, which the
+Angular CLI writes), where the names are read from. A build without source
+maps, or a map without its sources, is left as it is, with a warning, and
+the command still exits with 0: the detector goes on naming those classes by
+selector.
+
+It gives every class of the build, the app's and its libraries' (Angular's
+`RouterLink`, RxJS's `SafeSubscriber`, …), its name back as a static field,
+the first thing in its body: `class e{static name="UserCardComponent";…}`.
+The class is still `e` for the code that uses it, so nothing else changes.
+It only touches a class the source map says is a class of that name, checks
+that the result parses (with the app's own esbuild), and updates the source
+maps, so stack traces and error reports map as before. It is safe to run
+twice. On the demo app it restores 178 class names, adding 5.5 kB to the
+bundle (1 to 1.2 kB gzipped, on Angular 16 and 22).
+
+Run it right after `ng build`, before anything else uses the build:
+uploading its source maps to an error tracker, compressing its files,
+deploying it. Whatever ran before saw the old files.
+
+A changed script has a new hash, and a build can pin those. `ng-leak-names`
+updates the ones Angular writes: the `integrity` attributes of `index.html`
+(Subresource Integrity) and the hashes in `ngsw.json` (the service worker).
+If anything else holds a hash of a file it would change, such as the hashes
+of lazy chunks webpack's runtime checks them against (Angular 16 with
+Subresource Integrity), or the server bundle of a server-rendered app with
+Subresource Integrity, which embeds `index.html`, it leaves the whole build
+as it is, with a warning, and exits with 0.
+
+It changes the build all at once or not at all: it writes every new file
+next to the old one, then moves each into place. If it is stopped while
+moving them, it leaves a marker, and the next run refuses that build (exit
+code 1): build it again, and run it on the new build.
+
+Three things change for whoever looks at the build: stack traces read
+`UserCardComponent.ngOnInit` rather than `e.ngOnInit` (an error tracker that
+groups errors by their raw stack traces will group them anew once), a
+file's contents change but not the hash in its name, and anyone who loads
+the app can read its class names. Keep the source maps off the server: move
+or delete them once `ng-leak-names` (and any upload) has run.
+
+**Finding the cause.** With class names restored by `ng-leak-names`, or
+renamed by the detector (`renameMinifiedClasses`), filter the heap snapshot
+for the name the warning gives, and read the leaked instance's retainers, as
+in development. Renamed, only the classes the detector tracks have names
+there; restored, the classes along the way (the subscriber, the router, your
+services) have theirs too. With neither, the warning still says which
+component, directive or service leaked and where: reproduce it in a
+development build to see what holds it. Functions and closures keep their
+minified names in any case: with the source maps loaded in DevTools, each
+links to its source.
+
+What it costs: the detector stays in the bundle (about 23 kB minified, 8 kB
+gzipped, measured on Angular 16 and 22), and does in production what it does
+in development: one lookup for each element Angular inserts, and a sweep every
+`sweepIntervalMs` that looks only at what was destroyed and is still in
+memory (see [performance](docs/internal/performance.md)). To watch a share of
+sessions only, add the provider conditionally:
+
+```ts
+...(Math.random() < 0.05 ? [provideProductionMemoryLeakDetector({ logging: false })] : []),
+```
 
 ## API
 
@@ -154,17 +331,24 @@ which also cover directives and services now: see the
 
 | Method | |
 | --- | --- |
-| `report()` | Prints and returns a table: per class, its `name`, its `kind` (`component`, `directive` or `service`), instances in memory (`live`), leaked and reported (`stale`), leaked as part of their component's leak (`withOwner`), `awaitingGc`, and `heldByRouter` (Angular 16 and 20, see below). |
+| `report()` | Prints and returns a table: per class, its `name`, its `kind` (`component`, `directive` or `service`), the elements its instances in memory are on (`host`, `hosts`), instances in memory (`live`), leaked and reported (`stale`), leaked as part of their component's leak (`withOwner`), `awaitingGc`, and `heldByRouter` (Angular 16 and 20, see below). |
 | `sweep()` | Check for leaks now. |
 | `forceGc()` | `window.gc()` then `sweep()`. Needs Chrome started with `--js-flags="--expose-gc"`. |
 | `configure(options)` | Change options. |
-| `subscribe(listener)` | Get each leak as an event (`{ name, kind, host, stale, live, leakAgeMs, at, retained }`), `retained` being the directives and services that leaked with a component (`[{ name, kind, count }]`). Returns an unsubscribe function. |
+| `subscribe(listener)` | Get each leak as an event (`{ name, kind, host, hosts, stale, live, leakAgeMs, at, retained }`), `retained` being the directives and services that leaked with a component (`[{ name, kind, count }]`). Returns an unsubscribe function. |
 | `rescan()` | Look through the whole document again: for components rendered into a detached tree, and for services created after their element appeared (see [Limitations](#limitations)). |
 
 In events and rows, `name` is the class name (of a component, a directive or
-a service: see `kind`), and `host` is the tag of the component's host, of the
-directive's element (`ng-template` / `ng-container` for one on those), or of
-the element that provides the service.
+a service: see `kind`). `hosts` lists the tags of the elements its
+instances are on (the component's host, the directive's element,
+`ng-template` / `ng-container` for one on those, or the element that
+provides the service), in alphabetical order, with how many instances on
+each: in an event, the instances that leaked; in a row, those in memory. A
+directive that leaked on two `<button>`s and an `<a>` has `hosts: [{ host:
+"a", count: 1 }, { host: "button", count: 2 }]`, and its warning says `on
+<a>, <button> ×2`. `host` is the first of them, a single tag to show or
+group by: it doesn't depend on the order the detector saw the elements in,
+only on which ones there are.
 
 To forward leaks somewhere, for example in an end-to-end test:
 
@@ -174,6 +358,8 @@ window.__ngLeakDetector?.subscribe((event) => console.log("leak", event));
 
 `startMemoryLeakDetector(options)` starts the detector without the provider
 and returns the same API, or `null` outside development mode.
+`startProductionMemoryLeakDetector(options)` does the same in every build,
+like `provideProductionMemoryLeakDetector()`.
 
 ## How it works
 
@@ -231,6 +417,22 @@ and returns the same API, or `null` outside development mode.
    [Angular 16 and 20](#angular-16-and-20-pages-the-router-keeps)).
 8. **Staying out of change detection.** With zone.js, the detector's timer and
    observer run outside Angular's zone, so they never trigger change detection.
+9. **Production builds.** Without `window.ng`, the same lookups are made
+   with `new DebugNode(node)` (public API, which unlike `getDebugNode`
+   stores nothing on the node): its `injector` is the node's injector, whose
+   view data says where the node's component and directives are, as in
+   development; its `componentInstance` is the node's component, or else the
+   component whose template it is in. Angular's anchor comments are
+   empty in production, so whether one anchors an `<ng-template>` or an
+   `<ng-container>` comes from its node's type. Whether the build minified
+   class names comes from a class of the detector's own, bundled along with
+   the app's; a class named by a single character counts as minified too,
+   for builds that minify the app's code and not its dependencies. With
+   `renameMinifiedClasses` on, such a class gets the name the detector gives
+   it as its `name`, the one a heap snapshot shows: the only change the
+   detector ever makes to a class, and only to one whose name says nothing.
+   Where the build makes source maps, `ng-leak-names` (`src/cli/`) can also
+   restore class names after the build, so that none is minified.
 
 ## Limitations
 
@@ -245,15 +447,48 @@ and returns the same API, or `null` outside development mode.
   has seen the first instance of that template.
 - Like components, directives in views that are never attached to the
   document are not seen.
+- In a production build, services whose class has no decorator are not
+  watched: Angular records how providers were declared in development only,
+  and without a factory of its own a class provider can't be told from a
+  `useValue` one. Add `@Injectable()` to have them watched there too.
+- `ng-leak-names` needs the build's source maps, with the sources in them
+  (the Angular CLI includes them); without, it leaves the build as it is.
+  It leaves alone the rare class whose superclass is an expression rather
+  than a name (`extends mixin(Base)`).
 
 ## Compatibility
 
-- Angular 16 or later, standalone or NgModule, with or without zone.js.
+- Angular 16 or later, standalone or NgModule, with or without zone.js,
+  development or production build.
   The end-to-end suite runs on every major from 16 to 22: with zone.js on
-  all of them, and zoneless from 18 on (experimental in Angular 18 and 19).
+  all of them, zoneless from 18 on (experimental in Angular 18 and 19), and
+  as a production build with `provideProductionMemoryLeakDetector()`.
 - A browser with `WeakRef` and `FinalizationRegistry` (all current browsers).
   The suite runs in Chromium.
 - Does nothing during server-side rendering.
+
+### Later versions of Angular
+
+The detector imports only Angular's public API (a test checks it), so no
+version of Angular can break the build of an app that uses it: a bundler
+fails on an import that doesn't exist, even one that is never used, and a
+private one (`ɵ…`) can be renamed or removed in any release.
+
+What it needs of Angular's internals (how a view lays out its nodes'
+directives and providers, the view id on each node, the definition the
+compiler adds to each class), it reads from objects at runtime, on every
+version from 16 to 22 alike. If a later Angular changes them, the detector
+finds less, never anything wrong: services, say, if the providers' layout
+changes; and if it finds none of the app's components although Angular has
+rendered the app, it says so in the console rather than passing for an app
+without leaks:
+
+```
+[ng-leak] Found none of this app's components, although Angular 23.0.0 has rendered <app-root>: this version of Angular may keep them in a way this version of the detector doesn't know (it supports Angular 16 to 22). It will report no leaks.
+```
+
+A new major is supported once the end-to-end suite passes on it (see
+[Older Angular versions](#older-angular-versions) for adding one).
 
 ### Angular 16 and 20: pages the router keeps
 
@@ -307,7 +542,16 @@ next to its fixed version (a directive and component-level services, with
 and without `@Injectable()`, included), a component that keeps its view
 (reported once, with the directives and services in it), router navigation (nested routes, a page that leaks, and a page
 that keeps the service it provides included), heap-snapshot names, zone.js,
-and retained elements:
+and retained elements. They run on the app served four ways: zoneless, on
+zone.js, and twice built for production (optimized and minified,
+`ngDevMode` off, hidden source maps) with
+`provideProductionMemoryLeakDetector()`, its `production-detector`
+configuration: once with the class names `ng-leak-names` restores, where
+they expect the same names as in development, heap snapshots included, and
+once without, where they expect the names of a minified build. The
+production builds are made with `ng build` and served as is
+(`scripts/serve-static.mjs`), not by the dev server, which on some versions
+keeps development mode on:
 
 ```bash
 npm run demo:install # build, pack and install the detector into demo/
@@ -346,7 +590,10 @@ npm run e2e:compat -- 18 --grep timer  # extra arguments go to Playwright
 `npm run bundle:check` (or `npm run bundle:check -- 16 22`) builds each app
 for production and checks that none of the detector's code is left in it. It
 also builds each app for development and checks that the detector's code is
-found there, so the check can't pass by looking for the wrong thing.
+found there, so the check can't pass by looking for the wrong thing. And it
+builds each app for production with `provideProductionMemoryLeakDetector()`
+(the `production-detector` configuration) and checks that the detector is
+there.
 
 `compat/app/` is copied into each workspace's `src/` by both commands; edit
 it there, not in the copies. To try a major by hand, run

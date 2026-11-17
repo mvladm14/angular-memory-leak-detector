@@ -1,6 +1,7 @@
 // Runtime configuration. Mutable so that `configure()` can hot-update behavior
 // (logging, thresholds, sweep cadence) while the app runs.
 
+import { isNameOf } from "./names.js";
 import type { InstanceKind, LeakDetectorOptions } from "./types.js";
 
 export const _config: LeakDetectorOptions = {
@@ -12,6 +13,7 @@ export const _config: LeakDetectorOptions = {
   exclude: [],
   trackDirectives: true,
   trackServices: true,
+  renameMinifiedClasses: false,
 };
 
 const intervalChangeListeners = new Set<() => void>();
@@ -32,10 +34,16 @@ export function configure(options: Partial<LeakDetectorOptions> = {}): void {
   }
 }
 
+/**
+ * `name`: as names.ts gives it. A class in `exclude` matches the names its
+ * instances were given: none before one is seen.
+ */
 export function isExcluded(name: string): boolean {
-  return _config.exclude.some((rule) =>
-    typeof rule === "string" ? rule === name : rule.test(name),
-  );
+  return _config.exclude.some((rule) => {
+    if (typeof rule === "string") return rule === name;
+    if (typeof rule === "function") return isNameOf(rule, name);
+    return rule.test(name);
+  });
 }
 
 /** Components are always tracked; directives and services unless turned off. */

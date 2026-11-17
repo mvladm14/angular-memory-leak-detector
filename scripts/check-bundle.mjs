@@ -1,6 +1,8 @@
 // Checks that a production build of each app contains none of the detector's
 // code, as the README promises, and that a development build does contain it,
-// so the check can't pass by looking for the wrong thing.
+// so the check can't pass by looking for the wrong thing. And that a
+// production build made with `provideProductionMemoryLeakDetector` (the
+// apps' `production-detector` configuration) does contain it.
 //
 //   node scripts/check-bundle.mjs          every app: compat/ngNN and demo/
 //   node scripts/check-bundle.mjs 16 22    Angular 16 and 22 only
@@ -26,6 +28,7 @@ const FINGERPRINTS = {
   heldByRouter: /\bheldByRouter\b/g, // pages the router keeps: router.ts
   companions: /\bcompanions\b/g, // directives and services on a component's host: discovery.ts, router.ts
   trackDirectives: /\btrackDirectives\b/g, // what is tracked besides components: config.ts, discovery.ts
+  "production build": /classes named by selector/g, // the banner in a production build: detector.ts
 };
 
 const args = process.argv.slice(2);
@@ -59,18 +62,27 @@ for (const major of majors) {
     warnOnNodeMismatch(app);
     const dev = fingerprintsIn(app, "development", path.join(out, "development"));
     const prod = fingerprintsIn(app, "production", path.join(out, "production"));
+    const opted = fingerprintsIn(app, "production-detector", path.join(out, "production-detector"));
     for (const name of Object.keys(FINGERPRINTS)) {
       const problem =
         dev[name] === 0 ? "  <- missing from the development build: stale fingerprint"
         : prod[name] > 0 ? "  <- detector code in the production build"
+        : opted[name] === 0 ? "  <- missing from the production build with provideProductionMemoryLeakDetector"
         : "";
       if (problem) ok = false;
-      console.log(`${name.padEnd(16)} development: ${String(dev[name]).padStart(3)}  production: ${String(prod[name]).padStart(3)}${problem}`);
+      console.log(
+        `${name.padEnd(16)} development: ${String(dev[name]).padStart(3)}  production: ${String(prod[name]).padStart(3)}` +
+          `  production-detector: ${String(opted[name]).padStart(3)}${problem}`,
+      );
     }
   } finally {
     rmSync(out, { recursive: true, force: true });
   }
 }
 
-console.log(ok ? "\nNo detector code in any production build." : "\nFAILED");
+console.log(
+  ok
+    ? "\nNo detector code in any production build, except with provideProductionMemoryLeakDetector."
+    : "\nFAILED",
+);
 process.exitCode = ok ? 0 : 1;
