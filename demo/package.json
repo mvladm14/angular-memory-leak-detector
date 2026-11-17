@@ -6,6 +6,8 @@
   "scripts": {
     "start": "ng serve",
     "start:zone": "ng serve --configuration zone",
+    "start:production": "ng build --configuration production-detector --output-path dist/production-detector --progress=false && ng-leak-names dist/production-detector --quiet && node ../scripts/serve-static.mjs dist/production-detector",
+    "start:production-minified": "ng build --configuration production-detector --output-path dist/production-minified --progress=false && node ../scripts/serve-static.mjs dist/production-minified",
     "build": "ng build"
   },
   "dependencies": {

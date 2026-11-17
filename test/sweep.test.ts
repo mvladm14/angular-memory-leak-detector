@@ -134,16 +134,17 @@ describe("sweep", () => {
   });
 });
 
-describe("componentNameOf", () => {
+describe("class names (src/names.ts)", () => {
   it("drops the underscore esbuild adds to class names", async () => {
-    const { lifecycle } = await loadRuntime();
+    const { names } = await loadRuntime();
+    const nameOf = (instance: object) => names.namesOf(instance).name;
     class _UserCardComponent {}
     class Plain {}
     class _private {}
-    expect(lifecycle.componentNameOf(new _UserCardComponent())).toBe("UserCardComponent");
-    expect(lifecycle.componentNameOf(new Plain())).toBe("Plain");
-    expect(lifecycle.componentNameOf(new _private())).toBe("_private");
-    expect(lifecycle.componentNameOf(Object.create(null))).toBe("Unknown");
+    expect(nameOf(new _UserCardComponent())).toBe("UserCardComponent");
+    expect(nameOf(new Plain())).toBe("Plain");
+    expect(nameOf(new _private())).toBe("_private");
+    expect(nameOf(Object.create(null))).toBe("Unknown");
   });
 });
 

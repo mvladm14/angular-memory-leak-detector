@@ -5,8 +5,9 @@
 // - `destroyed`: the entries of `live` whose instance Angular has destroyed.
 //                The only ones a sweep has to look at: in an app that frees
 //                what it destroys, it stays small however big the app is.
-// - `stats`    : per-class-name info (kind, host tag, instances in `live`,
-//                last-created time, last-warn time).
+// - `stats`    : per-class-name info (kind, runtime class name, instances in
+//                `live` and per tag of their elements, last-created time,
+//                last-warn time).
 // - `registry` : when an instance is collected, forget its entry.
 // - `entries`  : each tracked instance's entry, for callers handed an instance.
 
@@ -29,7 +30,9 @@ export function entryOf(instance: object): LiveEntry | undefined {
 export function addEntry(instance: object, entry: LiveEntry): void {
   live.add(entry);
   entries.set(instance, entry);
-  getStats(entry.componentName).live += 1;
+  const s = getStats(entry.componentName);
+  s.live += 1;
+  s.hosts.set(entry.host, (s.hosts.get(entry.host) ?? 0) + 1);
   registry ??= new FinalizationRegistry<LiveEntry>(forget);
   registry.register(instance, entry);
 }
@@ -44,13 +47,25 @@ export function forget(entry: LiveEntry): void {
   if (!live.delete(entry)) return;
   destroyed.delete(entry);
   const s = stats.get(entry.componentName);
-  if (s) s.live -= 1;
+  if (!s) return;
+  s.live -= 1;
+  const onTag = (s.hosts.get(entry.host) ?? 0) - 1;
+  if (onTag > 0) s.hosts.set(entry.host, onTag);
+  else s.hosts.delete(entry.host);
 }
 
 export function getStats(name: string): ComponentStats {
   let s = stats.get(name);
   if (!s) {
-    s = { kind: "component", host: "", live: 0, lastCreatedAt: 0, lastWarnedAt: 0 };
+    s = {
+      kind: "component",
+      hosts: new Map(),
+      seen: false,
+      className: name,
+      live: 0,
+      lastCreatedAt: 0,
+      lastWarnedAt: 0,
+    };
     stats.set(name, s);
   }
   return s;

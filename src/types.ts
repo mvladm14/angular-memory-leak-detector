@@ -15,7 +15,11 @@ export type InstanceKind = "component" | "directive" | "service";
 export type LiveEntry = {
   /** The instance. Held weakly: the detector must never keep it alive. */
   ref: WeakRef<object>;
-  /** The instance's class name (for any kind: the name is historical). */
+  /**
+   * The name of the instance's class (for any kind: the field's name is
+   * historical): its class name, or in a minified build its selector
+   * (names.ts).
+   */
   componentName: string;
   kind: InstanceKind;
   /**
@@ -59,7 +63,16 @@ export type Witness = { ref: WeakRef<object> };
 
 export type ComponentStats = {
   kind: InstanceKind;
-  host: string;
+  /**
+   * Per tag, how many of the class's instances in memory (its entries in
+   * `live`) are on an element of that tag. Kept as they come and go, so that
+   * a report needn't walk them.
+   */
+  hosts: Map<string, number>;
+  /** Whether an instance has been seen: `kind` and `className` are its class's. */
+  seen: boolean;
+  /** The class's name at runtime, minified in a minified build (names.ts). */
+  className: string;
   /** Instances of the class still in memory: its entries in `live`. */
   live: number;
   lastCreatedAt: number;
@@ -71,15 +84,33 @@ export type LeakEvent = {
    * Class name of the leaked instance: of a component (`UserCardComponent`),
    * a directive (`TooltipDirective`) or a service (`CartStore`), see `kind`.
    * The name to filter by in a heap snapshot.
+   *
+   * In a minified production build, where class names are mangled: the
+   * selector of a component (`app-user-card`) or directive
+   * (`[appTooltip]`), a component without one by its component id
+   * (`ng-component (c2736387395)`), and a service by where it is provided
+   * (`app-cart providers[0]`). It depends only on what leaked, never on what
+   * the detector saw before: the same leak has the same name in every
+   * session, so events from many can be grouped by it. Classes that share a
+   * selector share the name.
    */
   name: string;
   /** Whether it is a component, a directive or a component-level service. */
   kind: InstanceKind;
   /**
    * Tag name of its element, e.g. `app-user-card`: the component's host, the
-   * directive's element, or the element that provides the service.
+   * directive's element, or the element that provides the service. Of the
+   * leaked instances' elements, the first tag in alphabetical order: the
+   * same whatever order the detector saw them in. `hosts` lists them all.
    */
   host: string;
+  /**
+   * The tags of the leaked instances' elements, in alphabetical order, each
+   * with how many of them are on one: a directive that leaked on two
+   * `<button>`s and an `<a>` has `[{ host: "a", count: 1 }, { host:
+   * "button", count: 2 }]`. `host` is the first.
+   */
+  hosts: HostCount[];
   /**
    * Number of instances destroyed ≥ leakAgeMs ago that are still reachable
    * after a garbage collection that ran once they had been destroyed that long.
@@ -102,6 +133,14 @@ export type LeakEvent = {
 
 export type LeakListener = (event: LeakEvent) => void;
 
+/** Instances of a class on elements of one tag. */
+export type HostCount = {
+  /** The tag, e.g. `button`, or `ng-template` / `ng-container`. */
+  host: string;
+  /** How many instances. */
+  count: number;
+};
+
 /** Instances of one class that leaked together with a component, as part of its leak. */
 export type RetainedInstances = {
   /** Class name of the directive or service. */
@@ -112,10 +151,19 @@ export type RetainedInstances = {
 };
 
 export type ReportRow = {
-  /** Class name: of a component, a directive or a service (see `kind`). */
+  /**
+   * Class name: of a component, a directive or a service (see `kind`). In a
+   * minified build, a selector or minified name, as in LeakEvent.
+   */
   name: string;
   kind: InstanceKind;
+  /**
+   * Of the elements its instances in memory are on, the first tag in
+   * alphabetical order, as in LeakEvent. `hosts` lists them all.
+   */
   host: string;
+  /** The tags of its instances' elements, with how many on each, as in LeakEvent. */
+  hosts: HostCount[];
   /** Reachable instances, alive or destroyed. */
   live: number;
   /**
@@ -146,6 +194,9 @@ export type ReportRow = {
   lastCreatedSecsAgo: number;
 };
 
+/** A class: a component, directive or service. */
+export type ClassRef = abstract new (...args: never[]) => unknown;
+
 export type LeakDetectorOptions = {
   /** Console output (warnings, the install banner, `report()`'s table). Default `true`. */
   logging: boolean;
@@ -159,10 +210,13 @@ export type LeakDetectorOptions = {
   warnCooldownMs: number;
   /**
    * Classes never reported (components, directives or services), by class
-   * name (`"UserCardComponent"`) or pattern. Use it for instances something
-   * keeps on purpose, e.g. a cache.
+   * name (`"UserCardComponent"`), pattern, or the class itself
+   * (`UserCardComponent`). Use it for instances something keeps on purpose,
+   * e.g. a cache. A name or pattern is matched against `name`, which in a
+   * minified build is a selector or a minified name: the class itself works
+   * in every build.
    */
-  exclude: ReadonlyArray<string | RegExp>;
+  exclude: ReadonlyArray<string | RegExp | ClassRef>;
   /**
    * Track directives too, Angular's own included (`RouterLink`, `NgIf`, …).
    * Default `true`. Turning it off also hides the ones already tracked.
@@ -174,4 +228,17 @@ export type LeakDetectorOptions = {
    * already tracked.
    */
   trackServices: boolean;
+  /**
+   * In a minified build, give each class the detector names by its selector
+   * or provider (`app-user-card`) that name as its `name` too, which is what
+   * a heap snapshot shows, so that the warning and the heap snapshot agree.
+   * Only classes whose name is minified are renamed, when first seen; a
+   * service class provided in several places takes the name of the first
+   * (the warning gives it). Not needed once `ng-leak-names` has restored the
+   * build's class names. Default `false`: a class is renamed when the
+   * detector first sees one of its instances, so stack traces of errors
+   * thrown before then name it differently than those after, which error
+   * trackers may group apart.
+   */
+  renameMinifiedClasses: boolean;
 };

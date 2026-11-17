@@ -77,6 +77,18 @@ describe("directives", () => {
     ]);
   });
 
+  it("knows a template anchor whose comment Angular rewrote with its bindings", async () => {
+    // Angular 16 to 19 in development (and later ones with ng-reflect on)
+    // write a template anchor's bound inputs into its comment.
+    mods.discovery.startDiscovery();
+    class NgIf {}
+    const anchor = angular.anchor("template", { directives: [new NgIf()] });
+    anchor.data = 'bindings={\n  "ng-reflect-ng-if": "true"\n}';
+    document.body.appendChild(anchor);
+    await flushObserver();
+    expect(tracked()).toEqual([{ name: "NgIf", kind: "directive", host: "ng-template", destroyed: false }]);
+  });
+
   it("finds an anchor Angular inserts on its own", async () => {
     mods.discovery.startDiscovery();
     class IfRoleDirective {}
@@ -452,7 +464,7 @@ describe("what the detector keeps per instance", () => {
         return "_CardComponent";
       }
     }
-    const names = [new _CardComponent(), new _CardComponent(), new _CardComponent()].map(mods.lifecycle.componentNameOf);
+    const names = [new _CardComponent(), new _CardComponent(), new _CardComponent()].map((card) => mods.names.namesOf(card).name);
     expect(names).toEqual(["CardComponent", "CardComponent", "CardComponent"]);
     expect(reads).toBe(1);
   });

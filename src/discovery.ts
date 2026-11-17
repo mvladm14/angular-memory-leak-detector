@@ -1,7 +1,8 @@
 // Finds component, directive and component-level service instances, and
 // learns when Angular destroys them, with no build step: everything goes
 // through Angular's dev-mode debugging API (`window.ng`, published only when
-// `ngDevMode` is on).
+// `ngDevMode` is on), or in a production build, where there is none, through
+// the same lookups made from what Angular keeps there (production.ts).
 //
 // - A MutationObserver sees every node Angular inserts into the document:
 //   elements, and the comments Angular anchors `<ng-template>` and
@@ -42,15 +43,19 @@
 
 import { ChangeDetectorRef, DestroyRef } from "@angular/core";
 import { _config } from "./config.js";
-import { componentNameOf, markDestroyed, track } from "./lifecycle.js";
+import { markDestroyed, track } from "./lifecycle.js";
+import { namesOf, serviceNamesOf } from "./names.js";
 import { heldNavigations, isRouterOutlet, OUTLET_TAG, watchOutlet } from "./router.js";
 import { entryOf } from "./store.js";
 import type { InstanceKind, LiveEntry } from "./types.js";
 
 type NgInjector = { get(token: unknown, notFoundValue?: unknown): unknown };
 
-/** The parts of Angular's dev-mode global (`window.ng`) the detector uses. */
-type NgDebugApi = {
+/**
+ * The parts of Angular's dev-mode global (`window.ng`) the detector uses. In
+ * a production build, the same lookups made without it (production.ts).
+ */
+export type NgDebugApi = {
   getComponent(element: Element): object | null;
   getInjector(node: Node): NgInjector;
   /** Directives, and router outlets on Angular 16 and 20 (router.ts). */
@@ -80,11 +85,33 @@ type ViewDestroyRef = { onDestroy(callback: () => void): unknown };
 /** Where Angular stores a node's view context (a numeric view id by default). */
 const CONTEXT_KEY = "__ngContext__";
 
-export function ngApi(): NgDebugApi | null {
+/**
+ * What to look nodes up with where Angular publishes no debugging API (a
+ * production build), if the detector may run there: production.ts.
+ */
+let withoutDebugApi: NgDebugApi | null = null;
+
+/** Let discovery run without Angular's debugging API, with `api` (or not: `null`). */
+export function useWithoutDebugApi(api: NgDebugApi | null): void {
+  withoutDebugApi = api;
+}
+
+/** Angular's debugging API, where it is published (development builds). */
+function debugApi(): NgDebugApi | null {
   const ng = (globalThis as { ng?: Partial<NgDebugApi> }).ng;
   return ng && typeof ng.getComponent === "function" && typeof ng.getInjector === "function"
     ? (ng as NgDebugApi)
     : null;
+}
+
+/** Whether discovery runs on a stand-in for Angular's debugging API (a production build). */
+export function runsWithoutDebugApi(): boolean {
+  return debugApi() === null && withoutDebugApi !== null;
+}
+
+/** Angular's debugging API where it is published (development), else the stand-in, if any. */
+export function ngApi(): NgDebugApi | null {
+  return debugApi() ?? withoutDebugApi;
 }
 
 /**
@@ -203,7 +230,7 @@ const PROVIDERS_START_MASK = 0xfffff;
 /** How many of them are view providers, in `tNode.providerIndexes`. */
 const VIEW_PROVIDERS_SHIFT = 20;
 /** Index of the TView in an LView. */
-const TVIEW = 1;
+export const TVIEW = 1;
 
 /** The private fields of the NodeInjector `ng.getInjector()` returns. */
 type NodeInjectorInternals = {
@@ -279,11 +306,14 @@ function providerRecords(injector: NgInjector, ng: NgDebugApi): readonly Provide
   }
 }
 
+/** A service the node's providers created, and which of them it is: `providers[0]`, `viewProviders[1]`, … */
+type ProvidedService = { instance: object; provider: string };
+
 /**
  * The instances the node's own providers have created. `recordsOf` lists how
  * the app declared them, asked only if a slot needs it.
  */
-function providedServices(place: Place, recordsOf: () => readonly ProviderRecord[]): object[] {
+function providedServices(place: Place, recordsOf: () => readonly ProviderRecord[]): ProvidedService[] {
   const { tNode, lView, tView } = place;
   const { providerIndexes, directiveStart } = tNode;
   const { blueprint } = tView;
@@ -293,7 +323,10 @@ function providedServices(place: Place, recordsOf: () => readonly ProviderRecord
   const viewProvidersEnd = start + (providerIndexes >>> VIEW_PROVIDERS_SHIFT);
   let records: readonly ProviderRecord[] | undefined;
   let known = slotClasses.get(tView);
-  const services: object[] = [];
+  const services: ProvidedService[] = [];
+  // View providers first, as Angular lays them out.
+  const providerAt = (i: number) =>
+    i < viewProvidersEnd ? `viewProviders[${i - start}]` : `providers[${i - viewProvidersEnd}]`;
   for (let i = start; i < directiveStart; i++) {
     const value: unknown = lView[i];
     // Not created yet: the slot still holds the blueprint's factory. An
@@ -306,7 +339,7 @@ function providedServices(place: Place, recordsOf: () => readonly ProviderRecord
     const ctor: unknown = (value as { constructor?: unknown }).constructor;
     const ownFactory = typeof ctor === "function" && (ctor as { ɵfac?: unknown }).ɵfac;
     if (typeof factory === "function" && ownFactory === factory) {
-      services.push(value);
+      services.push({ instance: value, provider: providerAt(i) });
       continue;
     }
 
@@ -320,7 +353,9 @@ function providedServices(place: Place, recordsOf: () => readonly ProviderRecord
       classRef = known?.get(i);
     }
     // And this is what that class creates, not something else in its slot.
-    if (classRef && Object.getPrototypeOf(value) === classRef.prototype) services.push(value);
+    if (classRef && Object.getPrototypeOf(value) === classRef.prototype) {
+      services.push({ instance: value, provider: providerAt(i) });
+    }
   }
   return services;
 }
@@ -328,13 +363,23 @@ function providedServices(place: Place, recordsOf: () => readonly ProviderRecord
 // ---------------------------------------------------------------------------
 // Discovery.
 
+/** Angular's TNodeType of the nodes it anchors with a comment: `<ng-template>` and `<ng-container>`. */
+const TNODE_CONTAINER = 4;
+const TNODE_ELEMENT_CONTAINER = 8;
+
 /**
  * The tag to report for a node: the element's, or for a comment Angular
  * anchors a template or container with, `ng-template` / `ng-container`.
+ * In development Angular writes which into the comment; in production the
+ * comment is empty, and the node's TNode says (`tNodeType`, if known).
  */
-function hostNameOf(node: Element | Comment): string {
+function hostNameOf(node: Element | Comment, tNodeType: number | undefined): string {
   if (node.nodeType === Node.ELEMENT_NODE) return (node as Element).localName;
-  return (node as Comment).data === "container" ? "ng-template" : "ng-container";
+  const { data } = node as Comment;
+  if (data === "container") return "ng-template";
+  if (data === "ng-container") return "ng-container";
+  if (tNodeType === TNODE_CONTAINER) return "ng-template";
+  return "ng-container";
 }
 
 /** Track the component `el` hosts, if we haven't seen it. */
@@ -345,7 +390,8 @@ function trackComponent(el: Element, ng: NgDebugApi, instance: object): void {
     // On a component host the ViewRef's context is the component itself.
     // Anything else is a shape this version of the detector doesn't know.
     if (!isComponentViewRef(view) || view.context !== instance || view.destroyed) return;
-    const entry = track(instance, componentNameOf(instance), el.localName);
+    const { name, className } = namesOf(instance, _config.renameMinifiedClasses);
+    const entry = track(instance, name, el.localName, "component", className);
     view.onDestroy(onDestroyOf(entry));
   } finally {
     rejectUntracked(instance);
@@ -371,10 +417,17 @@ function rejectUntracked(instance: object): void {
 // The TNode and LView are at hand after the first `ng.*` lookup on a node:
 // it leaves a context on the node (an LContext: `lView` and `nodeIndex`).
 
-type TNodeShape = { directiveStart: number; directiveEnd: number; providerIndexes: number };
+/** `componentOffset`: where the node's component is among its directives, -1 if none (Angular 15 and later). */
+type TNodeShape = {
+  directiveStart: number;
+  directiveEnd: number;
+  providerIndexes: number;
+  type?: number;
+  componentOffset?: number;
+};
 
 /** A node's TNode and the view it is in. */
-type Place = { tNode: TNodeShape; lView: unknown[]; tView: TView & { blueprint: unknown[] } };
+export type Place = { tNode: TNodeShape; lView: unknown[]; tView: TView & { blueprint: unknown[] } };
 
 function placeOf(tNode: unknown, lView: unknown): Place | null {
   if (!Array.isArray(lView)) return null;
@@ -405,7 +458,7 @@ function placeFromContext(node: Node): Place | null {
 }
 
 /** From the NodeInjector `ng.getInjector()` returns. */
-function placeFromInjector(injector: NgInjector): Place | null {
+export function placeFromInjector(injector: NgInjector): Place | null {
   const { _tNode, _lView } = injector as NodeInjectorInternals;
   return placeOf(_tNode, _lView);
 }
@@ -417,7 +470,7 @@ const isBare = (place: Place) => place.tNode.directiveEnd <= place.tNode.directi
  * The node's directives, from their slots: not the component (Angular's
  * `ng.getDirectives` leaves it out too), nor a slot not created yet.
  */
-function directivesAt(place: Place, component: object | null): object[] {
+export function directivesAt(place: Place, component: object | null): object[] {
   const { tNode, lView, tView } = place;
   const directives: object[] = [];
   for (let i = tNode.directiveStart; i < tNode.directiveEnd; i++) {
@@ -497,41 +550,55 @@ function trackOnNode(
     }
   }
 
-  const found: Array<[object, InstanceKind]> = [];
+  const found: Found[] = [];
   if (_config.trackDirectives) {
     for (const directive of directives) {
-      if (typeof directive === "object" && directive !== null) found.push([directive, "directive"]);
+      if (typeof directive === "object" && directive !== null) found.push([directive, "directive", null]);
     }
   }
   if (_config.trackServices && here) {
     const services = providedServices(here, () => providerRecords(injectorOf(), ng));
-    for (const service of services) found.push([service, "service"]);
+    // Where a service is provided, to name it in a minified build (names.ts):
+    // the element, by its component or else its first directive. Asked only
+    // there, and only for a class not named yet.
+    const element = () => {
+      const first = component ?? directives.find((d): d is object => typeof d === "object" && d !== null);
+      return first ? namesOf(first).name : hostNameOf(node, here.tNode.type);
+    };
+    for (const { instance, provider } of services) {
+      found.push([instance, "service", () => `${element()} ${provider}`]);
+    }
   }
   const fresh = found.filter(([instance]) => !isKnown(instance));
   if (fresh.length === 0) return;
   try {
-    trackFresh(node, ng, here?.lView ?? null, injectorOf, component, fresh);
+    trackFresh(node, ng, here, injectorOf, component, fresh);
   } finally {
     fresh.forEach(([instance]) => rejectUntracked(instance));
   }
 }
 
+/** An instance on a node, its kind, and for a service, where it is provided (names.ts). */
+type Found = [instance: object, kind: InstanceKind, provider: (() => string) | null];
+
 function trackFresh(
   node: Element | Comment,
   ng: NgDebugApi,
-  view: object | null,
+  place: Place | null,
   injectorOf: () => NgInjector,
   component: object | null,
-  fresh: ReadonlyArray<[object, InstanceKind]>,
+  fresh: readonly Found[],
 ): void {
-  const group = groupOf(view, injectorOf);
+  const group = groupOf(place?.lView ?? null, injectorOf);
   if (!group) return;
-  const host = hostNameOf(node);
+  const host = hostNameOf(node, place?.tNode.type);
   const hosted = component ? entryOf(component) : undefined;
   // Every node of a view belongs to the same component: looked up once.
   const owner = hosted ?? (group.owner === undefined ? (group.owner = ownerOf(node, ng) ?? null) : group.owner);
-  for (const [instance, kind] of fresh) {
-    const entry = track(instance, componentNameOf(instance), host, kind);
+  for (const [instance, kind, provider] of fresh) {
+    const rename = _config.renameMinifiedClasses;
+    const { name, className } = provider ? serviceNamesOf(instance, provider, rename) : namesOf(instance, rename);
+    const entry = track(instance, name, host, kind, className);
     entry.owner = owner;
     group.entries.push(entry);
     if (hosted) (hosted.companions ??= []).push(entry);
@@ -606,6 +673,7 @@ export function rescan(doc: Document = document): void {
 export function stopDiscovery(): void {
   observer?.disconnect();
   observer = null;
+  withoutDebugApi = null;
   rejected = new WeakSet();
   viewGroups = new WeakMap();
   observedRoots = new WeakSet();

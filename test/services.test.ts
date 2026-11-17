@@ -223,11 +223,11 @@ describe("component-level services", () => {
       await flushObserver();
       destroyAndCollect(embedded);
       expect(Object.keys(events[0]!).sort()).toEqual(
-        ["at", "host", "kind", "leakAgeMs", "live", "name", "retained", "stale"],
+        ["at", "host", "hosts", "kind", "leakAgeMs", "live", "name", "retained", "stale"],
       );
       expect(events[0]!.retained).toEqual([{ name: "CartStore", kind: "service", count: 1 }]);
       expect(Object.keys(mods.sweep.report()[0]!).sort()).toEqual(
-        ["awaitingGc", "heldByRouter", "host", "kind", "lastCreatedSecsAgo", "live", "name", "stale", "withOwner"],
+        ["awaitingGc", "heldByRouter", "host", "hosts", "kind", "lastCreatedSecsAgo", "live", "name", "stale", "withOwner"],
       );
     });
 

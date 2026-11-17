@@ -1,6 +1,12 @@
-export { provideMemoryLeakDetector } from "./provider.js";
-export { startMemoryLeakDetector, type LeakDetectorApi } from "./detector.js";
+export { provideMemoryLeakDetector, provideProductionMemoryLeakDetector } from "./provider.js";
+export {
+  startMemoryLeakDetector,
+  startProductionMemoryLeakDetector,
+  type LeakDetectorApi,
+} from "./detector.js";
 export type {
+  ClassRef,
+  HostCount,
   InstanceKind,
   LeakDetectorOptions,
   LeakEvent,
