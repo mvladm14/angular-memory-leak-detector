@@ -223,9 +223,11 @@ describe("component-level services", () => {
       await flushObserver();
       destroyAndCollect(embedded);
       expect(Object.keys(events[0]!).sort()).toEqual(
-        ["at", "host", "hosts", "kind", "leakAgeMs", "live", "name", "retained", "stale"],
+        ["at", "causes", "host", "hosts", "kind", "leakAgeMs", "live", "name", "retained", "stale"],
       );
       expect(events[0]!.retained).toEqual([{ name: "CartStore", kind: "service", count: 1 }]);
+      // Nothing the detector saw started: no cause to name.
+      expect(events[0]!.causes).toEqual([]);
       expect(Object.keys(mods.sweep.report()[0]!).sort()).toEqual(
         ["awaitingGc", "heldByRouter", "host", "hosts", "kind", "lastCreatedSecsAgo", "live", "name", "stale", "withOwner"],
       );

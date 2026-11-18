@@ -8,12 +8,13 @@ import {
   HostListener,
   Injectable,
   type OnDestroy,
+  type OnInit,
   inject,
   signal,
 } from "@angular/core";
 import { takeUntilDestroyed } from "@angular/core/rxjs-interop";
 import { RouterLink } from "@angular/router";
-import { BehaviorSubject, type Subscription } from "rxjs";
+import { BehaviorSubject, fromEvent, type Subscription, take } from "rxjs";
 
 /** A long-lived (root) service: anything subscribed to it outlives components. */
 @Injectable({ providedIn: "root" })
@@ -242,5 +243,320 @@ export class LeakyViewComponent {
       this.value = v;
       this.cdr.markForCheck();
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Leak culprits: what keeps each leaky one in memory is a different kind of
+// resource it started, named in its warning as the likely cause.
+
+/** Leak: a timeout set for an hour in ngOnInit, never cleared: it holds its callback, and `this`, until then. */
+@Component({
+  selector: "app-leaky-timeout",
+  template: `<p data-testid="leaky-timeout">Leaky timeout: {{ expired ? "expired" : "pending" }}</p>`,
+})
+export class LeakyTimeoutComponent implements OnInit {
+  expired = false;
+  ngOnInit(): void {
+    setTimeout(() => (this.expired = true), 60 * 60 * 1000);
+  }
+}
+
+@Component({
+  selector: "app-fixed-timeout",
+  template: `<p data-testid="fixed-timeout">Fixed timeout: {{ expired ? "expired" : "pending" }}</p>`,
+})
+export class FixedTimeoutComponent implements OnInit, OnDestroy {
+  expired = false;
+  private timeout?: ReturnType<typeof setTimeout>;
+  ngOnInit(): void {
+    this.timeout = setTimeout(() => (this.expired = true), 60 * 60 * 1000);
+  }
+  ngOnDestroy(): void {
+    clearTimeout(this.timeout);
+  }
+}
+
+/** Leak: an animation loop, each frame requesting the next, never stopped. */
+@Component({
+  selector: "app-leaky-animation",
+  template: `<p data-testid="leaky-animation">Leaky animation</p>`,
+})
+export class LeakyAnimationComponent {
+  frames = 0;
+  constructor() {
+    const tick = () => {
+      this.frames++;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+}
+
+@Component({
+  selector: "app-fixed-animation",
+  template: `<p data-testid="fixed-animation">Fixed animation</p>`,
+})
+export class FixedAnimationComponent {
+  frames = 0;
+  constructor() {
+    let frame = 0;
+    const tick = () => {
+      this.frames++;
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    inject(DestroyRef).onDestroy(() => cancelAnimationFrame(frame));
+  }
+}
+
+/** Leak: polling started by a click, each timeout setting the next, never stopped. */
+@Component({
+  selector: "app-leaky-polling",
+  template: `<p data-testid="leaky-polling">
+    Leaky polling: {{ polls }} <button type="button" data-testid="start-leaky-polling" (click)="start()">Start</button>
+  </p>`,
+})
+export class LeakyPollingComponent {
+  polls = 0;
+  start(): void {
+    const poll = () => {
+      this.polls++;
+      setTimeout(poll, 200);
+    };
+    setTimeout(poll, 200);
+  }
+}
+
+@Component({
+  selector: "app-fixed-polling",
+  template: `<p data-testid="fixed-polling">
+    Fixed polling: {{ polls }} <button type="button" data-testid="start-fixed-polling" (click)="start()">Start</button>
+  </p>`,
+})
+export class FixedPollingComponent {
+  polls = 0;
+  private timeout?: ReturnType<typeof setTimeout>;
+  constructor() {
+    inject(DestroyRef).onDestroy(() => clearTimeout(this.timeout));
+  }
+  start(): void {
+    const poll = () => {
+      this.polls++;
+      this.timeout = setTimeout(poll, 200);
+    };
+    this.timeout = setTimeout(poll, 200);
+  }
+}
+
+/**
+ * Leak: a directive that listens to `document` and never stops. Its listener
+ * refreshes the view through the ChangeDetectorRef, and so keeps the view the
+ * directive is in, and the component whose template that is: reported as the
+ * component's leak, with the directive's listener as the cause.
+ */
+@Directive({ selector: "[appLeakyVisibility]" })
+export class LeakyVisibilityDirective {
+  private readonly cdr = inject(ChangeDetectorRef);
+  constructor() {
+    document.addEventListener("visibilitychange", () => this.cdr.markForCheck());
+  }
+}
+
+@Directive({ selector: "[appFixedVisibility]" })
+export class FixedVisibilityDirective {
+  private readonly cdr = inject(ChangeDetectorRef);
+  constructor() {
+    const refresh = () => this.cdr.markForCheck();
+    document.addEventListener("visibilitychange", refresh);
+    inject(DestroyRef).onDestroy(() => document.removeEventListener("visibilitychange", refresh));
+  }
+}
+
+@Component({
+  selector: "app-leaky-panel",
+  imports: [LeakyVisibilityDirective],
+  template: `<p appLeakyVisibility data-testid="leaky-panel">Leaky panel</p>`,
+})
+export class LeakyPanelComponent {}
+
+@Component({
+  selector: "app-fixed-panel",
+  imports: [FixedVisibilityDirective],
+  template: `<p appFixedVisibility data-testid="fixed-panel">Fixed panel</p>`,
+})
+export class FixedPanelComponent {}
+
+/** Leak: `fromEvent` in ngOnInit, never unsubscribed: the subscription, and the listener it added. */
+@Component({
+  selector: "app-leaky-online",
+  template: `<p data-testid="leaky-online">Leaky online: {{ online }}</p>`,
+})
+export class LeakyOnlineComponent implements OnInit {
+  online = navigator.onLine;
+  ngOnInit(): void {
+    fromEvent(window, "online").subscribe(() => (this.online = true));
+  }
+}
+
+@Component({
+  selector: "app-fixed-online",
+  template: `<p data-testid="fixed-online">Fixed online: {{ online }}</p>`,
+})
+export class FixedOnlineComponent implements OnInit {
+  online = navigator.onLine;
+  private readonly destroyRef = inject(DestroyRef);
+  ngOnInit(): void {
+    fromEvent(window, "online")
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(() => (this.online = true));
+  }
+}
+
+/** A root service that keeps what registers with it. */
+@Injectable({ providedIn: "root" })
+export class PanelRegistry {
+  readonly panels = new Set<object>();
+}
+
+/**
+ * Leak: registers itself with a root service, which keeps it. Not a timer, a
+ * listener or a subscription: the detector reports the leak, and names no
+ * cause rather than a wrong one.
+ */
+@Component({
+  selector: "app-leaky-cache",
+  template: `<p data-testid="leaky-cache">Leaky cache</p>`,
+})
+export class LeakyCacheComponent {
+  constructor() {
+    inject(PanelRegistry).panels.add(this);
+  }
+}
+
+@Component({
+  selector: "app-fixed-cache",
+  template: `<p data-testid="fixed-cache">Fixed cache</p>`,
+})
+export class FixedCacheComponent {
+  constructor() {
+    const { panels } = inject(PanelRegistry);
+    panels.add(this);
+    inject(DestroyRef).onDestroy(() => panels.delete(this));
+  }
+}
+
+/** Leak: observes the page's size and never disconnects: the body keeps the observer, and it `this`. */
+@Component({
+  selector: "app-leaky-resize",
+  template: `<p data-testid="leaky-resize">Leaky resize: {{ width }}px</p>`,
+})
+export class LeakyResizeComponent {
+  width = 0;
+  constructor() {
+    new ResizeObserver(([entry]) => (this.width = entry?.contentRect.width ?? 0)).observe(document.body);
+  }
+}
+
+@Component({
+  selector: "app-fixed-resize",
+  template: `<p data-testid="fixed-resize">Fixed resize: {{ width }}px</p>`,
+})
+export class FixedResizeComponent {
+  width = 0;
+  constructor() {
+    const observer = new ResizeObserver(([entry]) => (this.width = entry?.contentRect.width ?? 0));
+    observer.observe(document.body);
+    inject(DestroyRef).onDestroy(() => observer.disconnect());
+  }
+}
+
+/** Leak: work done when the browser is idle, each round requesting the next, never stopped. */
+@Component({
+  selector: "app-leaky-idle",
+  template: `<p data-testid="leaky-idle">Leaky idle work</p>`,
+})
+export class LeakyIdleComponent {
+  rounds = 0;
+  constructor() {
+    const work = () => {
+      this.rounds++;
+      requestIdleCallback(work);
+    };
+    requestIdleCallback(work);
+  }
+}
+
+@Component({
+  selector: "app-fixed-idle",
+  template: `<p data-testid="fixed-idle">Fixed idle work</p>`,
+})
+export class FixedIdleComponent {
+  rounds = 0;
+  constructor() {
+    let request = 0;
+    const work = () => {
+      this.rounds++;
+      request = requestIdleCallback(work);
+    };
+    request = requestIdleCallback(work);
+    inject(DestroyRef).onDestroy(() => cancelIdleCallback(request));
+  }
+}
+
+/** Leak: a listener added `once`, for an event that never comes: it stays, and never goes. */
+@Component({
+  selector: "app-leaky-once",
+  template: `<p data-testid="leaky-once">Leaky once: {{ printing }}</p>`,
+})
+export class LeakyOnceComponent {
+  printing = false;
+  constructor() {
+    window.addEventListener("beforeprint", () => (this.printing = true), { once: true });
+  }
+}
+
+@Component({
+  selector: "app-fixed-once",
+  template: `<p data-testid="fixed-once">Fixed once: {{ printing }}</p>`,
+})
+export class FixedOnceComponent {
+  printing = false;
+  constructor() {
+    const onPrint = () => (this.printing = true);
+    window.addEventListener("beforeprint", onPrint, { once: true });
+    inject(DestroyRef).onDestroy(() => window.removeEventListener("beforeprint", onPrint));
+  }
+}
+
+/**
+ * Leak: its subscription ends after the first value (`take(1)`), but the
+ * interval its callback started runs on: that is what holds it.
+ */
+@Component({
+  selector: "app-leaky-callback",
+  template: `<p data-testid="leaky-callback">Leaky callback: {{ ticks }}</p>`,
+})
+export class LeakyCallbackComponent {
+  ticks = 0;
+  constructor() {
+    inject(TickerService)
+      .ticks$.pipe(take(1))
+      .subscribe(() => setInterval(() => this.ticks++, 1000));
+  }
+}
+
+@Component({
+  selector: "app-fixed-callback",
+  template: `<p data-testid="fixed-callback">Fixed callback: {{ ticks }}</p>`,
+})
+export class FixedCallbackComponent {
+  ticks = 0;
+  constructor() {
+    let interval: ReturnType<typeof setInterval> | undefined;
+    inject(TickerService)
+      .ticks$.pipe(take(1))
+      .subscribe(() => (interval = setInterval(() => this.ticks++, 1000)));
+    inject(DestroyRef).onDestroy(() => clearInterval(interval));
   }
 }

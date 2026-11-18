@@ -3,9 +3,38 @@
 ## Unreleased
 
 The detector can now run in production builds too, minified ones included.
+And a leak's warning now says what most likely holds it.
 
 ### Added
 
+- **The cause of a leak.** A warning names what most likely keeps the
+  leaked instance in memory: the timers, animation frames, event listeners
+  and RxJS subscriptions it started, never ended, and that are still active
+  long after Angular destroyed it (`Likely cause: setInterval every 1000 ms,
+  started in its constructor and never cleared.`). Events have them as
+  `causes` (type `LeakCause`): `kind` (`interval`, `timeout`,
+  `animationFrame`, `eventListener` or `subscription`, type
+  `LeakCauseKind`), `description` (`"resize" listener on window`),
+  `startedIn` (`"constructor"`, `"ngOnInit"`, …, `"event handler"`,
+  `"template"`), `by` and `byKind` (who started it: the leaked class, or a
+  directive or service that leaked with it and keeps it through its view),
+  and `count`. What constructors and field initializers start is known in
+  every build; what lifecycle hooks, event handlers and templates start, in
+  development builds (from Angular's profiler); loops (a timer or animation
+  frame whose callback schedules itself again) in every build. What the
+  detector doesn't know who started is never named: a leak with no cause it
+  knows of is reported as before.
+  Also named: `requestIdleCallback` (`idleCallback`), listeners added
+  `{ once: true }` until they fire, observers (`observer`: a
+  `ResizeObserver`, `MutationObserver` or `IntersectionObserver` never
+  disconnected, observing what is still in the document), and what the
+  callback of an instance's subscription starts (`startedIn: "subscription
+  callback"`, in every build).
+- **`trackCauses`** (default `true`): turns that off. It wraps `setTimeout`,
+  `setInterval`, `requestAnimationFrame`, `requestIdleCallback`,
+  `addEventListener`, the observer classes and their `observe` (and what
+  clears, removes or disconnects them) and RxJS's `subscribe`, from when the
+  provider is called; turned off, the wrappers only call through.
 - **`provideProductionMemoryLeakDetector(options)`** and
   **`startProductionMemoryLeakDetector(options)`**: the detector in every
   build, production included. In development they are
@@ -80,6 +109,12 @@ The detector can now run in production builds too, minified ones included.
 
 - In a production build, services whose class has no decorator are not
   found: Angular records how providers were declared in development only.
+- Causes: not watched are `on…` event properties and other observers
+  (`PerformanceObserver`, …); not known who started is what code after an
+  `await` starts (nothing carries who runs across one), and in a production
+  build what lifecycle hooks, event handlers and templates start. On Angular 16 to 19, whose
+  profiler takes one callback, a profiler set before the detector starts is
+  replaced; one set after it (Angular DevTools') is shared.
 
 ## 0.2.0
 

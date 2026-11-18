@@ -2,6 +2,7 @@
 // hold module-level singletons (the live set, listeners, config), so every
 // test gets its own copies while the cross-module references stay shared.
 
+import { Injector, runInInjectionContext } from "@angular/core";
 import { vi } from "vitest";
 
 export type Runtime = {
@@ -16,6 +17,9 @@ export type Runtime = {
   router: typeof import("../src/router");
   names: typeof import("../src/names");
   production: typeof import("../src/production");
+  ownership: typeof import("../src/ownership");
+  causes: typeof import("../src/causes");
+  instrument: typeof import("../src/instrument");
 };
 
 /**
@@ -44,6 +48,8 @@ class FakeDebugNode {
   }
 }
 
+let previous: Runtime | null = null;
+
 /**
  * `angular` stands in for the Angular major (`VERSION.major`) the detector
  * runs on; by default, the one installed. `production`: what the detector
@@ -57,6 +63,9 @@ export async function loadRuntime({
   production = false,
   minified = false,
 }: { seasoned?: boolean; angular?: number; production?: boolean; minified?: boolean } = {}): Promise<Runtime> {
+  // What the previous runtime wrapped (setTimeout, addEventListener, …), if
+  // it started the detector: put back before loading fresh copies.
+  previous?.instrument.stopCauses();
   vi.resetModules();
   if (angular === undefined && !production) vi.doUnmock("@angular/core");
   else {
@@ -81,7 +90,11 @@ export async function loadRuntime({
     router: await import("../src/router"),
     names: await import("../src/names"),
     production: await import("../src/production"),
+    ownership: await import("../src/ownership"),
+    causes: await import("../src/causes"),
+    instrument: await import("../src/instrument"),
   };
+  previous = mods;
   if (minified) mods.names.setClassNamesMinified(true);
   // What starting the detector does (src/detector.ts).
   mods.witness.startWitnesses();
@@ -106,6 +119,9 @@ export function simulateGc(mods: Runtime): void {
   });
   mods.witness.noteGc();
 }
+
+/** What a constructor gets from `build`, to create a service of its node. */
+export type Provider = { provide<S extends object>(n: number, make: () => S): S };
 
 export type FakeView = {
   context: unknown;
@@ -207,6 +223,12 @@ const TNODE_ELEMENT_CONTAINER = 8;
  * containers with empty comments. What the detector uses there instead
  * (src/production.ts), `DebugNode`, is faked from the same views, for
  * `loadRuntime({ production: true })`: its `injector` is `getInjector`'s.
+ *
+ * `ng.ɵsetProfiler` is Angular's profiler: from Angular 20 on it takes
+ * several, and returns a function that removes one; before, it keeps one,
+ * the last set. `hook`, `handler` and `template` run code as Angular runs a
+ * lifecycle hook, an event handler or a template, telling the profilers
+ * before and after (`profile` tells them anything).
  */
 export function fakeAngular(
   ChangeDetectorRef: unknown,
@@ -218,6 +240,28 @@ export function fakeAngular(
   }: { DestroyRef?: unknown; angular?: number; records?: "node" | "first-view" | "none"; production?: boolean } = {},
 ) {
   const hosts = new Map<Node, { instance: object; view: FakeView }>();
+  // Angular's profiler: several from 20 on, the last one set before.
+  type Profiler = (event: number, instance?: unknown, fn?: unknown) => void;
+  let profilers: Profiler[] = [];
+  const setProfiler = vi.fn((profiler: Profiler | null) => {
+    if (angular >= 20) {
+      if (profiler === null) profilers = [];
+      else if (!profilers.includes(profiler)) profilers.push(profiler);
+      return () => (profilers = profilers.filter((p) => p !== profiler));
+    }
+    profilers = profiler ? [profiler] : [];
+    return undefined;
+  });
+  const profile = (event: number, instance?: unknown, fn?: unknown) => profilers.forEach((p) => p(event, instance, fn));
+  /** Run `run` between the profiler events `start` and `start + 1`, as Angular does (even if it throws). */
+  const between = <T>(start: number, instance: unknown, fn: unknown, run: () => T): T => {
+    profile(start, instance, fn);
+    try {
+      return run();
+    } finally {
+      profile(start + 1, instance, fn);
+    }
+  };
   const directives = new Map<Node, unknown[]>();
   const owners = new Map<Node, object>();
   const contexts = new Map<Node, { lView: unknown[]; nodeIndex: number }>();
@@ -412,16 +456,54 @@ export function fakeAngular(
       },
     };
   } else {
-    (globalThis as any).ng = { getComponent, getDirectives, getInjector, getOwningComponent };
+    (globalThis as any).ng = { getComponent, getDirectives, getInjector, getOwningComponent, ɵsetProfiler: setProfiler };
     if (records !== "none") (globalThis as any).ng.ɵgetInjectorProviders = getInjectorProviders;
   }
 
-  return {
+  /**
+   * Angular creating what `node`'s slot `index` holds with `make`: in the
+   * node's injection context (where `inject(Injector)` is its NodeInjector),
+   * while the slot holds its factory, flagged `resolving`.
+   */
+  const construct = <T extends object>(node: Node, index: number, make: () => T): T => {
+    const internals = injectors.get(node);
+    if (!internals) throw new Error("not a node of this fake Angular");
+    const { lView, tNode } = internals;
+    const blueprint = (lView[TVIEW] as FakeTemplate["tView"]).blueprint;
+    const factory = (blueprint[index] ??= { factory: () => undefined, resolving: false }) as { resolving: boolean };
+    lView[index] = factory;
+    factory.resolving = true;
+    try {
+      const nodeInjector = { _tNode: tNode, _lView: lView, get: () => null };
+      const instance = runInInjectionContext({ get: (token: unknown) => (token === Injector ? nodeInjector : null) }, make);
+      lView[index] = instance;
+      return instance;
+    } finally {
+      factory.resolving = false;
+    }
+  };
+
+  const api = {
     getComponent,
     getDirectives,
     getInjector,
     getInjectorProviders,
     getOwningComponent,
+    setProfiler,
+    profile,
+    /** Run `run` as Angular runs `instance`'s lifecycle hook `name` (`ngOnInit`, …). */
+    hook<T>(instance: object, name: string, run: () => T): T {
+      return between(4, instance, { [name]() {} }[name], run);
+    },
+    /** Run `run` as Angular runs an event handler of a template whose context is `context`. */
+    handler<T>(context: unknown, run: () => T): T {
+      return between(6, context, run, run);
+    },
+    /** Run `run` as Angular renders (`create`) or refreshes a template whose context is `context`. */
+    template<T>(context: unknown, run: () => T, create = false): T {
+      return between(create ? 0 : 2, context, undefined, run);
+    },
+    construct,
     /** The view nodes are declared in unless told otherwise. */
     rootView,
     /** A new view to declare nodes in, e.g. the embedded view of an `@if`. */
@@ -511,7 +593,53 @@ export function fakeAngular(
       setUp(comment, options, { type: kind === "template" ? TNODE_CONTAINER : TNODE_ELEMENT_CONTAINER });
       return comment;
     },
+    /**
+     * An element created by Angular that hosts the component `make` creates
+     * (or none, for `null`), created as Angular creates it (see
+     * `construct`), then each of its directives, made by `directives` the
+     * same way: as `createComponent` does, which Angular 20 and later tell
+     * the profiler about (`DynamicComponentStart`). `provide(n, make)` creates the `n`th of its `providers`
+     * (give it a `lazy` slot), as Angular does when something first injects
+     * it: `make` gets it, for a constructor that injects one.
+     */
+    build<T extends object>(
+      tag: string,
+      make: ((self: Provider) => T) | null,
+      { directives: makers = [], ...options }: Omit<NodeOptions, "directives"> & { directives?: Array<() => object> } = {},
+    ) {
+      const stand = makers.map(() => ({}));
+      const made = make ? api.host(tag, {}, { ...options, directives: stand }) : null;
+      const el = made?.el ?? api.plain(tag, { ...options, directives: stand });
+      const { tNode, lView } = injectors.get(el)!;
+      const { directiveStart, providerIndexes } = tNode as { directiveStart: number; providerIndexes: number };
+      const providerStart = providerIndexes & PROVIDERS_START_MASK;
+      const self: Provider = {
+        provide<S extends object>(n: number, makeService: () => S): S {
+          const service = construct(el, providerStart + n, makeService);
+          // Its class's own factory, as `@Injectable()` gives it, for discovery.
+          const blueprint = (lView[TVIEW] as FakeTemplate["tView"]).blueprint;
+          (blueprint[providerStart + n] as { factory: unknown }).factory = (service.constructor as any).ɵfac;
+          return service;
+        },
+      };
+      // Angular 20 and later report creating a component outside a
+      // template (as `createComponent` does); 16 to 19.1 don't.
+      const creating = <R>(run: () => R): R => (angular >= 20 ? between(22, undefined, undefined, run) : run());
+      const { instance, built } = creating(() => {
+        let instance: T | null = null;
+        if (made && make) {
+          instance = construct(el, directiveStart, () => make(self));
+          hosts.get(el)!.instance = instance;
+          made.view.context = instance;
+        }
+        const first = directiveStart + (made ? 1 : 0);
+        return { instance, built: makers.map((makeDirective, k) => construct(el, first + k, makeDirective)) };
+      });
+      directives.set(el, built);
+      return { el, view: made?.view ?? null, instance, directives: built, ...self };
+    },
   };
+  return api;
 }
 
 /** Let the MutationObserver deliver. */

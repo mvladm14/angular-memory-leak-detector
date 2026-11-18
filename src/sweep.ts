@@ -24,12 +24,16 @@
 // verdict; if the owner is excluded, they are kept on purpose with it. A
 // stale one whose owner was collected, or is alive, leaked on its own, and is
 // reported on its own.
+//
+// Warnings also list likely causes (causes.ts), computed only when a warning
+// fires.
 
+import { type Causes, causesSentence, collect, sortedCauses } from "./causes.js";
 import { _config, isExcluded, isTrackedKind } from "./config.js";
 import { isMinifiedName } from "./names.js";
 import { destroyed, forget, getStats, stats } from "./store.js";
 import { emitLeak, hasListeners } from "./subscribers.js";
-import type { ComponentStats, HostCount, LiveEntry, ReportRow, RetainedInstances } from "./types.js";
+import type { ComponentStats, HostCount, LeakCause, LiveEntry, ReportRow, RetainedInstances } from "./types.js";
 import { isOverAge, survivedGc, syncWitness } from "./witness.js";
 
 type Bucket = {
@@ -39,6 +43,8 @@ type Bucket = {
   withOwner: number;
   /** Per tag, the stale ones (reported on their own) on an element of that tag. */
   hosts: Map<string, number>;
+  /** The stale entries reported on their own, for collecting causes. */
+  leaked: LiveEntry[];
 };
 
 /** Where a destroyed instance is, on its way to a verdict. */
@@ -54,16 +60,25 @@ function stateOf(entry: LiveEntry, now: number): State {
 type Tally = {
   /** Only the classes with destroyed instances still in memory. */
   perName: Map<string, Bucket>;
-  /** Per owner class name: what leaked with its leaked instances, by `kind:name`. */
-  retainedBy: Map<string, Map<string, RetainedInstances>>;
+  /** Per owner class name: the entries that leaked with its leaked instances, grouped by `kind:name`. */
+  retainedBy: Map<string, Map<string, LiveEntry[]>>;
 };
+
+const emptyBucket = (): Bucket => ({
+  stale: 0,
+  awaitingGc: 0,
+  heldByRouter: 0,
+  withOwner: 0,
+  hosts: new Map(),
+  leaked: [],
+});
 
 const isShown = (name: string, s: ComponentStats) => !isExcluded(name) && isTrackedKind(s.kind);
 
 function tally(): Tally {
   const now = Date.now();
   const perName = new Map<string, Bucket>();
-  const retainedBy = new Map<string, Map<string, RetainedInstances>>();
+  const retainedBy = new Map<string, Map<string, LiveEntry[]>>();
 
   // 1. Every destroyed instance still in memory, and its state. An owner can
   // come after what it owns: the verdicts need them all first.
@@ -90,10 +105,7 @@ function tally(): Tally {
     const name = entry.componentName;
     if (!isShown(name, getStats(name))) return;
     let bucket = perName.get(name);
-    if (!bucket) {
-      bucket = { stale: 0, awaitingGc: 0, heldByRouter: 0, withOwner: 0, hosts: new Map() };
-      perName.set(name, bucket);
-    }
+    if (!bucket) perName.set(name, (bucket = emptyBucket()));
     if (entry.heldByRouter) bucket.heldByRouter += 1;
     if (state === "awaitingGc") bucket.awaitingGc += 1;
     if (state !== "stale") return;
@@ -102,6 +114,7 @@ function tally(): Tally {
     if (ownerState === undefined) {
       bucket.stale += 1;
       bucket.hosts.set(entry.host, (bucket.hosts.get(entry.host) ?? 0) + 1);
+      bucket.leaked.push(entry);
       return;
     }
     bucket.withOwner += 1;
@@ -110,9 +123,9 @@ function tally(): Tally {
     let retained = retainedBy.get(ownerName);
     if (!retained) retainedBy.set(ownerName, (retained = new Map()));
     const key = `${entry.kind}:${name}`;
-    const row = retained.get(key);
-    if (row) row.count += 1;
-    else retained.set(key, { name, kind: entry.kind, count: 1 });
+    const group = retained.get(key);
+    if (group) group.push(entry);
+    else retained.set(key, [entry]);
   });
 
   return { perName, retainedBy };
@@ -199,11 +212,27 @@ function together(retained: readonly RetainedInstances[]): string {
   return `, together with ${counts.join(" and ")} of its own: ${names.join(", ")}${more}`;
 }
 
-/** Most first, then by name. */
-function sorted(retained: Map<string, RetainedInstances> | undefined): RetainedInstances[] {
-  return [...(retained?.values() ?? [])].sort(
-    (a, b) => b.count - a.count || a.name.localeCompare(b.name),
-  );
+/** One row per retained class, most first, then by name. */
+function sorted(retained: Map<string, LiveEntry[]> | undefined): RetainedInstances[] {
+  return [...(retained?.values() ?? [])]
+    .map((group) => ({ name: group[0]!.componentName, kind: group[0]!.kind, count: group.length }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
+/** Likely causes of `name`'s leak, from its leaked instances and those retained with them. */
+function causesOf(
+  name: string,
+  leaked: readonly LiveEntry[],
+  retained: Map<string, LiveEntry[]> | undefined,
+): { causes: LeakCause[]; sentence: string } {
+  if (!_config.trackCauses) return { causes: [], sentence: "" };
+  const causes: Causes = new Map();
+  for (const entry of [...leaked, ...[...(retained?.values() ?? [])].flat()]) {
+    const instance = entry.ref.deref();
+    if (instance) collect(causes, instance, entry.componentName, entry.kind);
+  }
+  const found = sortedCauses(causes, name);
+  return { causes: found.map(({ cause }) => cause), sentence: causesSentence(found, name) };
 }
 
 export function sweep(): void {
@@ -218,10 +247,11 @@ export function sweep(): void {
       const retained = sorted(retainedBy.get(name));
       // Where it leaked; with `suspectThreshold: 0` maybe nowhere, then where it is.
       const hosts = breakdown(bucket.hosts.size > 0 ? bucket.hosts : s.hosts);
+      const { causes, sentence } = causesOf(name, bucket.leaked, retainedBy.get(name));
       if (_config.logging) {
         // eslint-disable-next-line no-console
         console.warn(
-          `[ng-leak] Suspected leak: ${describe(name, s, hosts)} — ${bucket.stale} instance(s) destroyed >${_config.leakAgeMs / 1000}s ago still retained after garbage collection (live ${s.live} total)${together(retained)}. ${hint(name, s)}`,
+          `[ng-leak] Suspected leak: ${describe(name, s, hosts)} — ${bucket.stale} instance(s) destroyed >${_config.leakAgeMs / 1000}s ago still retained after garbage collection (live ${s.live} total)${together(retained)}.${sentence} ${hint(name, s)}`,
         );
       }
       if (hasListeners()) {
@@ -235,6 +265,7 @@ export function sweep(): void {
           leakAgeMs: _config.leakAgeMs,
           at: now,
           retained,
+          causes,
         });
       }
     }
@@ -245,7 +276,7 @@ export function report(): ReportRow[] {
   const now = Date.now();
   const { perName } = tally();
   const rows: ReportRow[] = [];
-  const none: Bucket = { stale: 0, awaitingGc: 0, heldByRouter: 0, withOwner: 0, hosts: new Map() };
+  const none = emptyBucket();
 
   stats.forEach((s, name) => {
     if (s.live <= 0 || !isShown(name, s)) return;
