@@ -8,7 +8,9 @@ type LeakEvent = {
   stale: number;
   live: number;
   retained: Array<{ name: string; kind: string; count: number }>;
+  causes: LeakCause[];
 };
+type LeakCause = { kind: string; description: string; startedIn: string | null; by: string; byKind: string; count: number };
 type ReportRow = ReturnType<NonNullable<Window["__ngLeakDetector"]>["report"]>[number];
 
 // `window.__ngLeakDetector` is declared by the detector (src/detector.ts).
@@ -58,6 +60,28 @@ const PRODUCTION_NAMES: Readonly<Record<string, string>> = {
   HighlightDirective: "[appHighlight]",
   RouterLink: "[routerLink]",
   ViewState: "app-leaky-view providers[0]",
+  LeakyTimeoutComponent: "app-leaky-timeout",
+  FixedTimeoutComponent: "app-fixed-timeout",
+  LeakyAnimationComponent: "app-leaky-animation",
+  FixedAnimationComponent: "app-fixed-animation",
+  LeakyPollingComponent: "app-leaky-polling",
+  FixedPollingComponent: "app-fixed-polling",
+  LeakyPanelComponent: "app-leaky-panel",
+  FixedPanelComponent: "app-fixed-panel",
+  LeakyVisibilityDirective: "[appLeakyVisibility]",
+  FixedVisibilityDirective: "[appFixedVisibility]",
+  LeakyOnlineComponent: "app-leaky-online",
+  FixedOnlineComponent: "app-fixed-online",
+  LeakyCacheComponent: "app-leaky-cache",
+  FixedCacheComponent: "app-fixed-cache",
+  LeakyResizeComponent: "app-leaky-resize",
+  FixedResizeComponent: "app-fixed-resize",
+  LeakyIdleComponent: "app-leaky-idle",
+  FixedIdleComponent: "app-fixed-idle",
+  LeakyOnceComponent: "app-leaky-once",
+  FixedOnceComponent: "app-fixed-once",
+  LeakyCallbackComponent: "app-leaky-callback",
+  FixedCallbackComponent: "app-fixed-callback",
 };
 
 /** What the detector calls the class `className` in the build under test. */
@@ -69,6 +93,14 @@ function nameIn(testInfo: TestInfo): (className: string) => string {
     return name;
   };
 }
+
+/**
+ * A cause a leak must name (the event's `causes`), `by` the leaky class
+ * unless said otherwise. A subscription's `description` names what it
+ * subscribed to, which a build with minified class names can't say:
+ * `subscription` there.
+ */
+type ExpectedCause = { kind: string; description: string; startedIn: string; by?: string; byKind?: string };
 
 type Pair = {
   id: string;
@@ -87,14 +119,53 @@ type Pair = {
    * records providers, in development only.
    */
   undecorated?: true;
+  /** What keeps the leaky one in memory, as its event names it: nothing the detector watches if empty. */
+  causes: ExpectedCause[];
+  /**
+   * The causes are found in development builds only: started in a
+   * lifecycle hook or an event handler, which only Angular's profiler tells
+   * the detector about. A production build reports the leak with no cause.
+   */
+  causesInDevelopment?: true;
+  /** How the warning names them, with class names as in development. */
+  sentence?: string;
+  /** Directives that leak with the leaky component, in its warning and event: `retained`. */
+  retained?: Array<{ name: string; kind: string; count: number }>;
+  /** A button to click in both, `<action>-leaky-<id>` and `<action>-fixed-<id>`, before destroying them. */
+  action?: string;
 };
 
 const PAIRS: Pair[] = [
-  { id: "timer", leaky: "LeakyTimerComponent", fixed: "FixedTimerComponent" },
-  { id: "subscription", leaky: "LeakySubscriptionComponent", fixed: "FixedSubscriptionComponent" },
-  { id: "listener", leaky: "LeakyListenerComponent", fixed: "FixedListenerComponent" },
+  {
+    id: "timer",
+    leaky: "LeakyTimerComponent",
+    fixed: "FixedTimerComponent",
+    causes: [{ kind: "interval", description: "setInterval every 1000 ms", startedIn: "constructor" }],
+    sentence: "Likely cause: setInterval every 1000 ms, started in its constructor and never cleared.",
+  },
+  {
+    id: "subscription",
+    leaky: "LeakySubscriptionComponent",
+    fixed: "FixedSubscriptionComponent",
+    causes: [{ kind: "subscription", description: "subscription to BehaviorSubject", startedIn: "constructor" }],
+    sentence: "Likely cause: subscription to BehaviorSubject, opened in its constructor and never unsubscribed.",
+  },
+  {
+    id: "listener",
+    leaky: "LeakyListenerComponent",
+    fixed: "FixedListenerComponent",
+    causes: [{ kind: "eventListener", description: '"resize" listener on window', startedIn: "constructor" }],
+    sentence: 'Likely cause: "resize" listener on window, added in its constructor and never removed.',
+  },
   // On a `<p>` in the app's template.
-  { id: "directive", leaky: "LeakyTooltipDirective", fixed: "FixedTooltipDirective", kind: "directive", host: "p" },
+  {
+    id: "directive",
+    leaky: "LeakyTooltipDirective",
+    fixed: "FixedTooltipDirective",
+    kind: "directive",
+    host: "p",
+    causes: [{ kind: "subscription", description: "subscription to BehaviorSubject", startedIn: "constructor" }],
+  },
   // Provided by a component: only the service leaks, the component doesn't.
   {
     id: "service",
@@ -102,6 +173,7 @@ const PAIRS: Pair[] = [
     fixed: "FixedStore",
     kind: "service",
     collected: ["LeakyServiceComponent", "FixedServiceComponent"],
+    causes: [{ kind: "subscription", description: "subscription to BehaviorSubject", startedIn: "constructor" }],
   },
   // The same, in classes without `@Injectable()`.
   {
@@ -112,8 +184,114 @@ const PAIRS: Pair[] = [
     collected: ["LeakyPlainServiceComponent", "FixedPlainServiceComponent"],
     untracked: ["Labels"],
     undecorated: true,
+    causes: [{ kind: "subscription", description: "subscription to BehaviorSubject", startedIn: "constructor" }],
+  },
+  // Leak culprits: a different resource keeps each leaky one.
+  {
+    id: "timeout",
+    leaky: "LeakyTimeoutComponent",
+    fixed: "FixedTimeoutComponent",
+    causes: [{ kind: "timeout", description: "setTimeout of 3600000 ms", startedIn: "ngOnInit" }],
+    causesInDevelopment: true,
+    sentence: "Likely cause: setTimeout of 3600000 ms, set in ngOnInit and still pending.",
+  },
+  {
+    id: "animation",
+    leaky: "LeakyAnimationComponent",
+    fixed: "FixedAnimationComponent",
+    // Each frame requests the next: a loop, started by the first.
+    causes: [{ kind: "animationFrame", description: "requestAnimationFrame loop", startedIn: "constructor" }],
+    sentence: "Likely cause: requestAnimationFrame loop, started in its constructor and never stopped.",
+  },
+  {
+    id: "polling",
+    leaky: "LeakyPollingComponent",
+    fixed: "FixedPollingComponent",
+    action: "start",
+    causes: [{ kind: "timeout", description: "setTimeout loop (every 200 ms)", startedIn: "event handler" }],
+    causesInDevelopment: true,
+    sentence: "Likely cause: setTimeout loop (every 200 ms), started in an event handler and never stopped.",
+  },
+  // The directive's listener keeps the component it is in: one leak, the component's.
+  {
+    id: "panel",
+    leaky: "LeakyPanelComponent",
+    fixed: "FixedPanelComponent",
+    collected: ["FixedVisibilityDirective"],
+    retained: [{ name: "LeakyVisibilityDirective", kind: "directive", count: 1 }],
+    causes: [
+      {
+        kind: "eventListener",
+        description: '"visibilitychange" listener on document',
+        startedIn: "constructor",
+        by: "LeakyVisibilityDirective",
+        byKind: "directive",
+      },
+    ],
+    sentence:
+      'Likely cause: "visibilitychange" listener on document, added by LeakyVisibilityDirective in its constructor and never removed.',
+  },
+  // `fromEvent`: the subscription, and the listener it added.
+  {
+    id: "online",
+    leaky: "LeakyOnlineComponent",
+    fixed: "FixedOnlineComponent",
+    causes: [
+      { kind: "eventListener", description: '"online" listener on window', startedIn: "ngOnInit" },
+      { kind: "subscription", description: "subscription to Observable", startedIn: "ngOnInit" },
+    ],
+    causesInDevelopment: true,
+    sentence:
+      'Likely causes: "online" listener on window, added in ngOnInit and never removed; subscription to Observable, opened in ngOnInit and never unsubscribed.',
+  },
+  // Kept by a root service: nothing the detector watches, so no cause.
+  { id: "cache", leaky: "LeakyCacheComponent", fixed: "FixedCacheComponent", causes: [] },
+  {
+    id: "resize",
+    leaky: "LeakyResizeComponent",
+    fixed: "FixedResizeComponent",
+    causes: [{ kind: "observer", description: "ResizeObserver observing <body>", startedIn: "constructor" }],
+    sentence: "Likely cause: ResizeObserver observing <body>, started in its constructor and never disconnected.",
+  },
+  {
+    id: "idle",
+    leaky: "LeakyIdleComponent",
+    fixed: "FixedIdleComponent",
+    causes: [{ kind: "idleCallback", description: "requestIdleCallback loop", startedIn: "constructor" }],
+    sentence: "Likely cause: requestIdleCallback loop, started in its constructor and never stopped.",
+  },
+  {
+    id: "once",
+    leaky: "LeakyOnceComponent",
+    fixed: "FixedOnceComponent",
+    causes: [{ kind: "eventListener", description: '"beforeprint" listener (once) on window', startedIn: "constructor" }],
+    sentence:
+      'Likely cause: "beforeprint" listener (once) on window, added in its constructor and never fired nor removed.',
+  },
+  // Its subscription completed; the interval its callback started didn't.
+  {
+    id: "callback",
+    leaky: "LeakyCallbackComponent",
+    fixed: "FixedCallbackComponent",
+    causes: [{ kind: "interval", description: "setInterval every 1000 ms", startedIn: "subscription callback" }],
+    sentence: "Likely cause: setInterval every 1000 ms, started in a subscription's callback and never cleared.",
   },
 ];
+
+/** The causes `pair`'s leak must name in the build under test. */
+function causesOf(pair: Pair, testInfo: TestInfo): LeakCause[] {
+  const { production, minifiedNames } = projectOf(testInfo);
+  if (production && pair.causesInDevelopment) return [];
+  const n = nameIn(testInfo);
+  return pair.causes.map(({ kind, description, startedIn, by, byKind }) => ({
+    kind,
+    description: minifiedNames && kind === "subscription" ? "subscription" : description,
+    startedIn,
+    by: n(by ?? pair.leaky),
+    byKind: byKind ?? pair.kind ?? "component",
+    count: 1,
+  }));
+}
 
 const hostOf = (pair: Pair) => pair.host ?? `app-leaky-${pair.id}`;
 
@@ -155,10 +333,12 @@ async function collect(page: Page, cdp: CDPSession, rounds = 6) {
   }));
 }
 
-async function createAndDestroy(page: Page, id: string) {
+/** `action`: a button to click in it (`<action>-<id>`) before destroying it. */
+async function createAndDestroy(page: Page, id: string, action?: string) {
   const toggle = page.getByTestId(`toggle-${id}`);
   await toggle.click();
   await expect(page.getByTestId(id)).toBeVisible();
+  if (action) await page.getByTestId(`${action}-${id}`).click();
   await toggle.click();
   await expect(page.getByTestId(id)).toHaveCount(0);
 }
@@ -233,8 +413,8 @@ for (const pair of PAIRS) {
     });
     const cdp = await open(page);
 
-    await createAndDestroy(page, `leaky-${pair.id}`);
-    await createAndDestroy(page, `fixed-${pair.id}`);
+    await createAndDestroy(page, `leaky-${pair.id}`, pair.action);
+    await createAndDestroy(page, `fixed-${pair.id}`, pair.action);
 
     let result = await collect(page, cdp);
     for (let i = 0; i < 5 && !result.events.some((e) => e.name === n(pair.leaky)); i++)
@@ -257,6 +437,20 @@ for (const pair of PAIRS) {
       expect(result.report.some((r) => r.name === name), `${name} must not be tracked`).toBe(false);
     }
     expect(warnings.some((w) => w.includes(warningOf(pair, testInfo)))).toBe(true);
+
+    // What keeps it in memory.
+    const causes = causesOf(pair, testInfo);
+    expect(leak!.causes, `${pair.leaky}'s causes`).toEqual(causes);
+    expect(leak!.retained).toEqual((pair.retained ?? []).map((r) => ({ ...r, name: n(r.name) })));
+    // Reported with the component that leaked, not on their own.
+    for (const { name } of pair.retained ?? []) {
+      expect(result.events.some((e) => e.name === n(name)), `${name} must not be reported on its own`).toBe(false);
+    }
+    const warning = warnings.find((w) => w.includes(warningOf(pair, testInfo)))!;
+    expect(warning.includes("Likely cause"), warning).toBe(causes.length > 0);
+    if (pair.sentence && causes.length > 0 && !projectOf(testInfo).minifiedNames) {
+      expect(warning).toContain(` ${pair.sentence} Take a heap snapshot`);
+    }
   });
 }
 
@@ -294,6 +488,11 @@ test("reports a component that keeps its view once, with the directives and serv
   const row = (name: string) => result.report.find((r) => r.name === n(name));
   expect(row("HighlightDirective")).toMatchObject({ stale: 0, withOwner: 2 });
   expect(row("ViewState")).toMatchObject({ stale: 0, withOwner: 1 });
+  // Its subscription, not anything of what it keeps.
+  const subscription = projectOf(testInfo).minifiedNames ? "subscription" : "subscription to BehaviorSubject";
+  expect(result.events[0]!.causes).toEqual([
+    { kind: "subscription", description: subscription, startedIn: "constructor", by: n("LeakyViewComponent"), byKind: "component", count: 1 },
+  ]);
 });
 
 /** Navigate with the app's link to `id`, and wait for its page. */
@@ -407,6 +606,11 @@ test("reports a page that leaks, once the router lets go of it", async ({ page }
     stale: 1,
     host: "app-leaky-page",
   });
+  // Created by the router, and its constructor's subscription found all the same.
+  const subscription = projectOf(testInfo).minifiedNames ? "subscription" : "subscription to BehaviorSubject";
+  expect(result.events.find((e) => e.name === n("LeakyPageComponent"))!.causes).toEqual([
+    { kind: "subscription", description: subscription, startedIn: "constructor", by: n("LeakyPageComponent"), byKind: "component", count: 1 },
+  ]);
   // Nothing else: the pages the router only kept are not reported.
   expect([...new Set(result.events.map((e) => e.name))]).toEqual([n("LeakyPageComponent")]);
   const described = projectOf(testInfo).minifiedNames ? "component <app-leaky-page>" : "LeakyPageComponent <app-leaky-page>";

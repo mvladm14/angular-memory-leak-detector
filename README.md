@@ -3,13 +3,14 @@
 Spot Angular memory leaks while you develop. When a destroyed component,
 directive or component-level service is still held in memory (by a
 subscription, a timer, an event listener or a closure), you get a **console
-warning** with its class name. No build plugin and no code changes beyond one
-provider.
+warning** with its class name and, most of the time, **what holds it**: the
+timer, listener, observer or subscription it started and never ended. No build plugin
+and no code changes beyond one provider.
 
 ```
-[ng-leak] Suspected leak: UserCardComponent <app-user-card> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total). Take a heap snapshot and filter for "UserCardComponent" to see what holds it.
-[ng-leak] Suspected leak: directive TooltipDirective on <button> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total). Take a heap snapshot and filter for "TooltipDirective" to see what holds it.
-[ng-leak] Suspected leak: service CartStore provided by <app-cart> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total). Take a heap snapshot and filter for "CartStore" to see what holds it.
+[ng-leak] Suspected leak: UserCardComponent <app-user-card> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total). Likely cause: setInterval every 1000 ms, started in its constructor and never cleared. Take a heap snapshot and filter for "UserCardComponent" to see what holds it.
+[ng-leak] Suspected leak: directive TooltipDirective on <button> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total). Likely cause: "scroll" listener on window, added in ngOnInit and never removed. Take a heap snapshot and filter for "TooltipDirective" to see what holds it.
+[ng-leak] Suspected leak: service CartStore provided by <app-cart> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total). Likely cause: subscription to BehaviorSubject, opened in its constructor and never unsubscribed. Take a heap snapshot and filter for "CartStore" to see what holds it.
 ```
 
 What it watches:
@@ -78,18 +79,87 @@ Instances waiting for that collection show up as **awaitingGc** in
 
 ## Finding the cause
 
-The warning tells you *what* leaked. A heap snapshot tells you *why*. In
-Chrome DevTools → Memory, take a snapshot and type the class name from the
-warning in the class filter. Dev builds made with the Angular CLI's esbuild
-builder name the class `_UserCardComponent`, and the filter matches either
-form. Select an instance and read the **Retainers** panel bottom-up. The usual
-causes are the same for components, directives and services:
+The warning tells you *what* leaked, and most of the time *why*: the
+timers, animation frames, idle callbacks, event listeners, observers and
+RxJS subscriptions the leaked instance started, never ended, and that are
+still active long after Angular destroyed it. Those are the usual causes of
+a leak, for components, directives and services alike: the browser holds an
+active timer's, listener's or observer's callback, a long-lived observable
+(a root service, the router, a store) holds its subscribers, and a callback
+that uses `this` holds the instance. The warning names them as its **likely cause**:
 
-- a subscription to a long-lived observable (a root service, the router, a
-  store) that is never unsubscribed;
-- `setInterval`, `setTimeout`, `requestAnimationFrame` or `addEventListener`
-  that is never cleared;
-- a root service or cache that stores the component or one of its callbacks.
+| Cause (`kind`) | Named while it is | As |
+| --- | --- | --- |
+| `interval` | running: a `setInterval` never cleared | `setInterval every 1000 ms, started in its constructor and never cleared` |
+| `timeout` | pending: a `setTimeout` neither fired nor cleared, or a loop of them (each callback setting the next) | `setTimeout of 3600000 ms, set in ngOnInit and still pending`, `setTimeout loop (every 200 ms), started in an event handler and never stopped` |
+| `animationFrame` | pending: a `requestAnimationFrame`, most often a loop (each frame requesting the next) | `requestAnimationFrame loop, started in its constructor and never stopped` |
+| `idleCallback` | pending: a `requestIdleCallback`, or a loop of them | `requestIdleCallback loop, started in its constructor and never stopped` |
+| `eventListener` | registered, never removed, on something that outlives the instance: `window`, `document`, an element still in the document, a `MediaQueryList`, …; added `{ once: true }`, until it fires | `"resize" listener on window, added in ngAfterViewInit and never removed`, `"beforeprint" listener (once) on window, added in its constructor and never fired nor removed` |
+| `observer` | observing, never disconnected: a `ResizeObserver`, `MutationObserver` or `IntersectionObserver`, while what it observes is still in the document | `ResizeObserver observing <body>, started in its constructor and never disconnected` |
+| `subscription` | open: never unsubscribed, nor completed | `subscription to BehaviorSubject, opened in its constructor and never unsubscribed` |
+
+Several are listed its own first, then those of what leaked with it (see
+below), each likeliest first (what the browser itself holds, then what a
+subscription holds), with how many when there are several alike (`×2`). In events they are
+`causes` (see [API](#api)), with `startedIn`: `"constructor"` (field
+initializers included), the lifecycle hook (`"ngOnInit"`, …), `"event
+handler"` (bound in a template or with `@HostListener`), `"template"`
+(while Angular rendered it: a pipe, an input setter), or `"subscription
+callback"` (in the callback of a subscription it opened). A listener on, or
+an observer of, an element of the instance's own view is never named: the
+element goes with it. `fromEvent(window, "resize").subscribe(…)` is both a subscription and
+the listener it added, and both are named.
+
+**What the detector knows started it.** It wraps `setTimeout`,
+`setInterval`, `requestAnimationFrame`, `requestIdleCallback`,
+`addEventListener`, the observers' `observe`, what clears, removes or
+disconnects them, and RxJS's `subscribe`, and records what a component,
+directive or service starts:
+
+- in its constructor and field initializers, in every build;
+- in its lifecycle hooks, event handlers and template, in development
+  builds, where Angular's profiler says whose code it runs;
+- in the callbacks of the subscriptions it opened (`route.params.subscribe(…
+  setInterval(…))`), in every build: the code of a callback is the code of
+  whoever subscribed, when it runs within something else's too;
+- in the callback of a timer, animation frame or idle callback of its own
+  that schedules itself again: a loop.
+
+What something else starts is no one's, and never named as a cause:
+anything a timer's callback starts other than itself (it can run anything,
+Angular's change detection for the whole app included), code after an
+`await`, a root service. The leak is still reported, with no cause rather
+than a wrong one.
+
+Code after an `await` can't be told: JavaScript carries nothing from the
+code before an `await` to the code after it that a library could read (zone.js
+can't see a native `await` either). In an `async ngOnInit()`, what comes
+before the first `await` is known, what comes after it isn't: start what
+should be named before it, or in the constructor.
+
+Something a service starts for the instance, from its code, counts as the
+instance's too: its methods run within the instance's code (a click
+handler calling `dialog.open()`, say). That is usually right, a service
+doing work for the component; a root service that starts something of its
+own the first time it is asked, and keeps it, is the exception: if the
+instance then leaks for another reason, that one is named too.
+
+**"Likely".** A cause is something the leaked instance started and never
+ended, which is almost always what holds it, but not always: a callback that
+doesn't refer to the instance doesn't keep it (an interval that still runs
+for nothing is worth fixing anyway), and a subscription to something the
+instance owns (a form's `valueChanges`, a `Subject` of its own) stays open
+with it without keeping it: next to another cause, the other one is the
+likelier.
+
+**With no cause named, or to be sure,** a heap snapshot shows what holds
+it. In Chrome DevTools → Memory, take a snapshot and type the class name
+from the warning in the class filter. Dev builds made with the Angular CLI's
+esbuild builder name the class `_UserCardComponent`, and the filter matches
+either form. Select an instance and read the **Retainers** panel bottom-up.
+What the detector doesn't watch shows there: a root service or cache that
+stores the instance or one of its callbacks, and the rest of [what it can't
+tell](#limitations).
 
 **A leaked component's directives and services come in its warning.** A
 component that holds something tied to its view (an injected
@@ -98,7 +168,16 @@ view, and with it every directive and service in there. Those are not reported
 one by one, but listed in the component's warning, most first:
 
 ```
-[ng-leak] Suspected leak: CartComponent <app-cart> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total), together with 3 directive(s) and 1 service(s) of its own: RouterLink ×2, CartStore, TooltipDirective. Take a heap snapshot and filter for "CartComponent" to see what holds it.
+[ng-leak] Suspected leak: CartComponent <app-cart> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total), together with 3 directive(s) and 1 service(s) of its own: RouterLink ×2, CartStore, TooltipDirective. Likely cause: subscription to BehaviorSubject, opened in its constructor and never unsubscribed. Take a heap snapshot and filter for "CartComponent" to see what holds it.
+```
+
+What those directives and services started counts as the component's
+cause too, with who started it: a directive that keeps the view it is in
+(through its `ChangeDetectorRef`, say) keeps the component, and its listener
+is why.
+
+```
+[ng-leak] Suspected leak: PanelComponent <app-panel> — 1 instance(s) destroyed >10s ago still retained after garbage collection (live 1 total), together with 1 directive(s) of its own: VisibilityDirective. Likely cause: "visibilitychange" listener on document, added by VisibilityDirective in its constructor and never removed. Take a heap snapshot and filter for "PanelComponent" to see what holds it.
 ```
 
 A directive or service belongs to the component on its element, if there is
@@ -136,6 +215,7 @@ provideMemoryLeakDetector({
   trackDirectives: true,  // watch directives too
   trackServices: true,    // watch component-level services too
   renameMinifiedClasses: false, // in a minified build, see Production builds
+  trackCauses: true,      // name what keeps a leaked instance, see Finding the cause
 });
 ```
 
@@ -148,6 +228,16 @@ Turning `trackDirectives` or `trackServices` off stops tracking new ones and
 hides those already tracked from `report()` and from leak reports. With both
 off, only components are tracked: a place to start if an app with many
 directives or component-level services feels slow to render in development.
+
+`trackCauses` wraps `setTimeout`, `setInterval`, `requestAnimationFrame`,
+`requestIdleCallback`, `addEventListener`, the `ResizeObserver`,
+`MutationObserver` and `IntersectionObserver` classes and their `observe`
+(and what clears, removes or disconnects them) and RxJS's `subscribe`,
+as soon as the provider is called, before Angular creates the first
+component, so that what its constructor starts is seen too. Each wrapper
+calls what it wraps and returns what it returned, with zone.js what zone.js
+put there. Turned off, they only call through,
+nothing new is recorded, and warnings name no cause.
 
 Change them while the app runs with `window.__ngLeakDetector.configure({ … })`.
 
@@ -299,6 +389,18 @@ file's contents change but not the hash in its name, and anyone who loads
 the app can read its class names. Keep the source maps off the server: move
 or delete them once `ng-leak-names` (and any upload) has run.
 
+**Causes.** A warning names what most likely keeps a leaked instance in a
+production build too, with one difference: without Angular's profiler,
+which only development builds have, the detector can't tell whose lifecycle
+hook, event handler or template is running. So it names what constructors
+and field initializers started, with the loops they started and what the
+callbacks of the subscriptions they opened started, but not what `ngOnInit`
+or a click handler did: a leak caused by those is reported with no cause,
+as before. Where class names are minified, a subscription is
+named without what it subscribed to (`subscription`, not `subscription to
+BehaviorSubject`), and `by` goes by the name the warning uses (`by
+[appVisibility]`).
+
 **Finding the cause.** With class names restored by `ng-leak-names`, or
 renamed by the detector (`renameMinifiedClasses`), filter the heap snapshot
 for the name the warning gives, and read the leaked instance's retainers, as
@@ -312,9 +414,12 @@ links to its source.
 
 What it costs: the detector stays in the bundle (about 23 kB minified, 8 kB
 gzipped, measured on Angular 16 and 22), and does in production what it does
-in development: one lookup for each element Angular inserts, and a sweep every
+in development: one lookup for each element Angular inserts, a sweep every
 `sweepIntervalMs` that looks only at what was destroyed and is still in
-memory (see [performance](docs/internal/performance.md)). To watch a share of
+memory (see [performance](docs/internal/performance.md)), and with
+`trackCauses` (on by default) the wrappers around the app's timers,
+listeners and subscriptions. Turn it off with `trackCauses: false` to keep
+the app's own calls as they are. To watch a share of
 sessions only, add the provider conditionally:
 
 ```ts
@@ -335,7 +440,7 @@ which also cover directives and services now: see the
 | `sweep()` | Check for leaks now. |
 | `forceGc()` | `window.gc()` then `sweep()`. Needs Chrome started with `--js-flags="--expose-gc"`. |
 | `configure(options)` | Change options. |
-| `subscribe(listener)` | Get each leak as an event (`{ name, kind, host, hosts, stale, live, leakAgeMs, at, retained }`), `retained` being the directives and services that leaked with a component (`[{ name, kind, count }]`). Returns an unsubscribe function. |
+| `subscribe(listener)` | Get each leak as an event (`{ name, kind, host, hosts, stale, live, leakAgeMs, at, retained, causes }`), `retained` being the directives and services that leaked with a component (`[{ name, kind, count }]`), and `causes` what most likely keeps it in memory (`[{ kind, description, startedIn, by, byKind, count }]`, see [Finding the cause](#finding-the-cause)). Returns an unsubscribe function. |
 | `rescan()` | Look through the whole document again: for components rendered into a detached tree, and for services created after their element appeared (see [Limitations](#limitations)). |
 
 In events and rows, `name` is the class name (of a component, a directive or
@@ -349,6 +454,14 @@ directive that leaked on two `<button>`s and an `<a>` has `hosts: [{ host:
 <a>, <button> ×2`. `host` is the first of them, a single tag to show or
 group by: it doesn't depend on the order the detector saw the elements in,
 only on which ones there are.
+
+In `causes`, `kind` is `interval`, `timeout`, `animationFrame`,
+`eventListener` or `subscription`, `description` says which
+(`"resize" listener on window`), `startedIn` where in its code it was
+started (`"constructor"`, `"ngOnInit"`, …, `"event handler"`,
+`"template"`, or `null`), `by` and `byKind` who started it (the leaked class,
+or a directive or service that leaked with it), and `count` how many alike.
+Empty when the detector knows of nothing it started and never ended.
 
 To forward leaks somewhere, for example in an end-to-end test:
 
@@ -433,6 +546,66 @@ like `provideProductionMemoryLeakDetector()`.
    detector ever makes to a class, and only to one whose name says nothing.
    Where the build makes source maps, `ng-leak-names` (`src/cli/`) can also
    restore class names after the build, so that none is minified.
+10. **Causes.** The detector wraps `setTimeout`, `setInterval`,
+    `requestAnimationFrame`, `requestIdleCallback`,
+    `EventTarget.prototype.addEventListener`, `observe` of
+    `ResizeObserver`, `MutationObserver` and `IntersectionObserver`, what
+    clears, removes or disconnects them, and `subscribe` on the
+    `Observable.prototype` of the RxJS Angular uses (up the prototypes of its
+    public `EventEmitter`: no import of RxJS). Each records what it starts
+    only if it knows who is starting it, its *owner*:
+    - **Constructors.** A constructor and its field initializers run in an
+      injection context (Angular's public `assertInInjectionContext`), where
+      `inject(Injector)` is the node's NodeInjector. While Angular creates an
+      instance, the view slot that will hold it holds its factory, flagged
+      `resolving` (its check for cyclic dependencies): that slot is the
+      owner, read once the constructor returns. An injection context that
+      isn't a node's (a root service created from a component's constructor)
+      is no one's. Outside one, `assertInInjectionContext` throws, so in
+      development, from Angular 19.2 on, the detector asks only while
+      Angular's profiler reports it creating a template, or a component
+      outside one, which is where constructors run. Before 19.2, which doesn't report
+      creating a component outside a template, and in production builds,
+      which have no profiler, it asks on every call. The listeners Angular
+      adds for templates and `@HostListener`, which it removes itself, are
+      never asked about: Angular's DOM renderer wraps them in a function
+      whose source holds a string (`__ngUnwrap__`, which Angular's own
+      `DebugNode` looks for too), which minifiers keep. Nor are the
+      subscriptions of the `async` pipe (its `next` calls
+      `_updateLatestValue`, a property name minifiers keep), nor, in
+      development builds, where its listener's name tells them, the output
+      subscriptions Angular makes for templates.
+    - **Lifecycle hooks, event handlers and templates**, in development:
+      Angular's profiler (`ng.ɵsetProfiler`, what Angular DevTools' Profiler
+      uses) tells the detector whose it runs. From Angular 20 it takes several
+      profilers; before, one, which the detector shares with whoever sets one
+      after it, so DevTools' Profiler keeps working.
+    - **Subscription callbacks**: the callbacks of an owner's subscription
+      are wrapped, to run as the owner's code, inside whatever emitted:
+      innermost first, as Angular's frames are.
+    - **Loops**: a timer, animation frame or idle callback of an owner whose
+      callback schedules itself again (the same function, or one with the
+      same source) is that owner's too.
+
+    Records hold nothing of their owner: they are found through a `WeakMap`
+    keyed by it, and hold listener targets and subscriptions by `WeakRef`. A
+    timer or animation frame of an owner gets its callback wrapped, to know
+    when it fires; a listener never is, so removing it works as before: for
+    one added `{ once: true }`, the detector adds a listener of its own just
+    before it (passive, outside Angular's zone, doing nothing), which fires
+    just before it and tells it went, and goes with it. The observer classes
+    are wrapped too (same prototype, name, `instanceof` and subclasses), for
+    their callbacks to refer to the observer the app made: with zone.js, that
+    is zone.js's, which wraps the browser's, and which nothing else keeps (the
+    browser keeps its own, observing); and the callback gets the browser's,
+    known as the same observer, so that disconnecting either counts. RxJS's own plumbing
+    (each operator of a `pipe` subscribing to the one before) is told from
+    the app's subscriptions by what it passes to `subscribe`. When
+    an instance leaks, the sweep looks at its records, and at those of the
+    directives and services that leaked with it, for what is still active.
+    In development, Angular DevTools lists `Injector` among the dependencies
+    of a class whose constructor starts something: the detector's
+    `inject(Injector)`.
 
 ## Limitations
 
@@ -451,6 +624,31 @@ like `provideProductionMemoryLeakDetector()`.
   watched: Angular records how providers were declared in development only,
   and without a factory of its own a class provider can't be told from a
   `useValue` one. Add `@Injectable()` to have them watched there too.
+- Causes are named only for what the detector watches (timers, animation
+  frames, idle callbacks, event listeners, observers, RxJS subscriptions)
+  and knows who started (see [Finding the cause](#finding-the-cause)). Not
+  watched: `on…` event properties (`window.onresize = …`), other observers
+  (`PerformanceObserver`, …), and subscriptions to a copy of RxJS other
+  than the one Angular uses. Not known who started: what code after an
+  `await` (or in a promise's `then`) starts, and in a production build what
+  lifecycle hooks, event handlers and templates start.
+- A listener added `{ once: true }` comes with one of the detector's, which
+  the browser lists with it (DevTools' event listeners panel). If the same
+  function was already added the same way without `once` (which makes the
+  second call do nothing), the detector's stays until the event fires. An event handler of a template that is in an `@if`, `@for` or other
+  embedded view is not told apart either; one bound with `@HostListener` is
+  the component's whose template its element is in.
+- Anything a constructor starts is its own, even a shared resource that
+  something started lazily the first time (a library's global timer, say):
+  named as a cause only if the instance leaks, and still active.
+- In development, from Angular 19.2 on, a component-level service that
+  Angular creates on demand, when a lifecycle hook or an event handler
+  first injects it (`injector.get(…)`), is taken for that hook's or
+  handler's component: what its constructor starts is named as the
+  component's, started in that hook.
+- On Angular 16 to 19, Angular keeps one profiler at a time: one set before
+  the detector starts (there is none, unless a tool sets one before the app
+  bootstraps) is replaced by it.
 - `ng-leak-names` needs the build's source maps, with the sources in them
   (the Angular CLI includes them); without, it leaves the build as it is.
   It leaves alone the rare class whose superclass is an expression rather
@@ -539,7 +737,12 @@ npm run build
 End-to-end tests run the app in [`demo/`](demo/) (Angular 22, which needs
 Node 22.22+, see `.nvmrc`) in headless Chromium. They cover each leak pattern
 next to its fixed version (a directive and component-level services, with
-and without `@Injectable()`, included), a component that keeps its view
+and without `@Injectable()`, included), with the cause each warning must
+name: an interval, a pending timeout, an animation loop, a polling loop
+started by a click, a directive's listener that keeps its component,
+`fromEvent`, a `ResizeObserver`, an idle-callback loop, a `once` listener
+that never fires, an interval started in a subscription's callback, and a
+component kept by a root service, for which no cause must be named; a component that keeps its view
 (reported once, with the directives and services in it), router navigation (nested routes, a page that leaks, and a page
 that keeps the service it provides included), heap-snapshot names, zone.js,
 and retained elements. They run on the app served four ways: zoneless, on

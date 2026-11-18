@@ -8,6 +8,8 @@ export type {
   ClassRef,
   HostCount,
   InstanceKind,
+  LeakCause,
+  LeakCauseKind,
   LeakDetectorOptions,
   LeakEvent,
   LeakListener,

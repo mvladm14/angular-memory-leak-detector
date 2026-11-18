@@ -28,6 +28,7 @@ const FINGERPRINTS = {
   heldByRouter: /\bheldByRouter\b/g, // pages the router keeps: router.ts
   companions: /\bcompanions\b/g, // directives and services on a component's host: discovery.ts, router.ts
   trackDirectives: /\btrackDirectives\b/g, // what is tracked besides components: config.ts, discovery.ts
+  startedIn: /\bstartedIn\b/g, // the causes of leaks: causes.ts, instrument.ts, ownership.ts
   "production build": /classes named by selector/g, // the banner in a production build: detector.ts
 };
 

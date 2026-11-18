@@ -6,7 +6,7 @@
 // without WeakRef.
 
 import { isDevMode } from "@angular/core";
-import { _config, configure, onSweepIntervalChange } from "./config.js";
+import { _config, configure, onConfigure, onSweepIntervalChange } from "./config.js";
 import {
   type NgDebugApi,
   rescan,
@@ -14,6 +14,7 @@ import {
   startDiscovery,
   useWithoutDebugApi,
 } from "./discovery.js";
+import { startCauses } from "./instrument.js";
 import { classNamesMinified } from "./names.js";
 import { productionApi } from "./production.js";
 import { live } from "./store.js";
@@ -126,6 +127,9 @@ function install(
     configure(options);
     // `configure({ sweepIntervalMs })` restarts the loop with the new cadence.
     onSweepIntervalChange(restartSweepLoop);
+    // Install the cause wrappers now, or once `trackCauses` is turned on.
+    startCauses();
+    onConfigure(() => startCauses());
     startWitnesses();
     startSweepLoop();
     startDiscovery();

@@ -61,6 +61,70 @@ export type LiveEntry = {
 /** A released old-generation object, shared by the instances that went stale in one job. */
 export type Witness = { ref: WeakRef<object> };
 
+/** Kind of a recorded resource (causes.ts). */
+export type ResourceKind = LeakCauseKind;
+
+/**
+ * The resources a component, directive or service started (ownership.ts).
+ * Looked up by instance; never references it.
+ */
+export type Owner = {
+  /** Resources not known to have ended. */
+  resources: Set<Resource>;
+  /** Size of `resources` after the last prune. */
+  pruned: number;
+};
+
+type ResourceBase = {
+  /** Who started it. Reassigned only when two owners of one instance are merged. */
+  owner: Owner;
+  /** `LeakCause.startedIn`. */
+  startedIn: string | null;
+};
+
+/** A timer, animation frame or idle callback. Removed when it fires (except intervals) or is cleared. */
+export type TimerResource = ResourceBase & {
+  kind: "interval" | "timeout" | "animationFrame" | "idleCallback";
+  /** Delay in ms (0 for animation frames and idle callbacks). */
+  delay: number;
+  /** Re-scheduled by its own callback (see loops in ownership.ts). */
+  loop: boolean;
+};
+
+/** An event listener. References neither the target (weakly only) nor the listener. */
+export type ListenerResource = ResourceBase & {
+  kind: "eventListener";
+  target: WeakRef<EventTarget>;
+  type: string;
+  capture: boolean;
+  signal: WeakRef<AbortSignal> | null;
+  /** For `{ once: true }` listeners: the companion listener that detects firing (instrument.ts). */
+  companion: EventListener | null;
+  /** A `once` listener that has fired. */
+  fired: boolean;
+};
+
+/** A ResizeObserver, MutationObserver or IntersectionObserver. References it and its targets weakly. */
+export type ObserverResource = ResourceBase & {
+  kind: "observer";
+  /** The class name, for the description. */
+  observerType: string;
+  observer: WeakRef<object>;
+  /** Observed targets, minus those passed to `unobserve`. */
+  targets: Array<WeakRef<object>>;
+  disconnected: boolean;
+};
+
+/** An RxJS subscription. Referenced weakly. */
+export type SubscriptionResource = ResourceBase & {
+  kind: "subscription";
+  subscription: WeakRef<{ closed?: unknown }>;
+  /** Class name of the source observable (through operators), or `""`. */
+  source: string;
+};
+
+export type Resource = TimerResource | ListenerResource | ObserverResource | SubscriptionResource;
+
 export type ComponentStats = {
   kind: InstanceKind;
   /**
@@ -127,6 +191,15 @@ export type LeakEvent = {
    * component whose own directives and services were freed.
    */
   retained: RetainedInstances[];
+  /**
+   * Resources the leaked instances (or the directives and services that
+   * leaked with them) started and that are still active: the likely causes
+   * of the leak. Own causes first, then by likelihood. Empty if none is
+   * known, e.g. the instance is held by a cache or a closure, or by
+   * something whose starter couldn't be determined. Always empty with
+   * `trackCauses` off.
+   */
+  causes: LeakCause[];
   /** Timestamp (ms since epoch) at which the event was fired. */
   at: number;
 };
@@ -147,6 +220,61 @@ export type RetainedInstances = {
   name: string;
   kind: InstanceKind;
   /** How many of them. */
+  count: number;
+};
+
+/**
+ * Kind of resource holding a leaked instance:
+ * - `interval`: a `setInterval` not cleared;
+ * - `timeout`: a pending `setTimeout`, or a loop of them;
+ * - `animationFrame`: a pending `requestAnimationFrame`, usually a loop;
+ * - `idleCallback`: a pending `requestIdleCallback`, or a loop of them;
+ * - `eventListener`: a listener not removed (or a `once` listener not yet
+ *   fired) on a target that outlives the instance (`window`, `document`, an
+ *   attached element, a `MediaQueryList`, …);
+ * - `observer`: a `ResizeObserver`, `MutationObserver` or
+ *   `IntersectionObserver` not disconnected, observing an attached node;
+ * - `subscription`: an RxJS subscription not closed.
+ */
+export type LeakCauseKind =
+  | "interval"
+  | "timeout"
+  | "animationFrame"
+  | "idleCallback"
+  | "eventListener"
+  | "observer"
+  | "subscription";
+
+/**
+ * A resource started by a leaked instance (or by a directive or service that
+ * leaked with it, see `by`) and still active after the instance was
+ * destroyed. See the README, "Finding the cause".
+ */
+export type LeakCause = {
+  kind: LeakCauseKind;
+  /**
+   * E.g. `setInterval every 1000 ms`, `setTimeout loop (every 500 ms)`,
+   * `"resize" listener on window`, `"load" listener (once) on window`,
+   * `ResizeObserver observing <body>`, `subscription to BehaviorSubject`.
+   */
+  description: string;
+  /**
+   * Where in `by`'s code it was started: `"constructor"` (including field
+   * initializers), a lifecycle hook name (`"ngOnInit"`, …), `"event handler"`
+   * (template or `@HostListener` binding), `"template"` (during rendering,
+   * e.g. a pipe or input setter), or `"subscription callback"`. Hooks,
+   * handlers and templates are only detected in development builds. `null`
+   * if unknown.
+   */
+  startedIn: string | null;
+  /**
+   * `name` of the class that started it: the leaked class, or a directive or
+   * service that leaked with it (see `retained`).
+   */
+  by: string;
+  /** Whether `by` is a component, a directive or a service. */
+  byKind: InstanceKind;
+  /** Number of identical active resources. */
   count: number;
 };
 
@@ -241,4 +369,14 @@ export type LeakDetectorOptions = {
    * trackers may group apart.
    */
   renameMinifiedClasses: boolean;
+  /**
+   * Report likely causes of leaks (`causes` in events, "Likely cause" in
+   * warnings). Wraps `setTimeout`, `setInterval`, `requestAnimationFrame`,
+   * `requestIdleCallback`, `addEventListener`, the `ResizeObserver`,
+   * `MutationObserver` and `IntersectionObserver` classes, their
+   * clear/remove/disconnect counterparts, and RxJS's `subscribe`, and
+   * records what tracked instances start. Default `true`. When `false`, the
+   * wrappers only call through and no causes are reported.
+   */
+  trackCauses: boolean;
 };

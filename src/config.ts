@@ -14,6 +14,7 @@ export const _config: LeakDetectorOptions = {
   trackDirectives: true,
   trackServices: true,
   renameMinifiedClasses: false,
+  trackCauses: true,
 };
 
 const intervalChangeListeners = new Set<() => void>();
@@ -26,12 +27,20 @@ export function onSweepIntervalChange(cb: () => void): void {
   intervalChangeListeners.add(cb);
 }
 
+const configureListeners = new Set<() => void>();
+
+/** Register a callback that fires after every `configure()`. */
+export function onConfigure(cb: () => void): void {
+  configureListeners.add(cb);
+}
+
 export function configure(options: Partial<LeakDetectorOptions> = {}): void {
   const oldInterval = _config.sweepIntervalMs;
   Object.assign(_config, options);
   if (options.sweepIntervalMs && options.sweepIntervalMs !== oldInterval) {
     intervalChangeListeners.forEach((cb) => cb());
   }
+  configureListeners.forEach((cb) => cb());
 }
 
 /**
